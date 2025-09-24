@@ -1,0 +1,32 @@
+# Archivos de Python
+__pycache__/
+*.py[cod]
+*.pyc
+*.pyo
+*.pyd
+
+# Archivos y directorios de Emacs
+*.emacs.d/
+*.elc
+*.el
+auto-save-list/
+backup/
+binary/
+central-file-list/
+elisp/
+*~
+.emacs.d/
+.emacs.d/*
+.emacs.d/init.el.d/
+.emacs.d/personal/
+.emacs.d/personal/emacs-configuration.el
+.emacs.d/startup.el
+.emacs.d/elisp/
+.emacs.d/elisp/config/
+.emacs.d/elisp/config/init.el
+.emacs.d/elisp/config/packages.el
+.emacs.d/elisp/config/keybindings.el
+recentf.el
+tags
+Proof.bak
+# Puedes agregar otros patrones para archivos específicos que necesites ignorar
