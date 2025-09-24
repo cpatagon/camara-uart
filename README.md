@@ -88,7 +88,7 @@ sistema-camara-uart/
 * **Python 3.9+**
 * **pyserial**: `pip install pyserial`
 * Raspberry Pi con stack **libcamera** (para `rpicam-still`).
-* Permisos de acceso a `/dev/ttyS0` o `/dev/serial0` (usuario en grupo `dialout`).
+* Permisos de acceso a `/dev/serial0` (usuario en grupo `dialout`).
 
 ```bash
 # ejemplo
@@ -156,7 +156,7 @@ pip3 install --upgrade pyserial
 
 ```bash
 # Espera hasta 60 s por OK|size, XON/XOFF, resolución THUMBNAIL
-./init.sh client --port /dev/ttyS0 --baud 57600 --xonxoff \
+./init.sh client --port /dev/serial0 --baud 57600 --xonxoff \
   --resp-timeout 60 --resolution THUMBNAIL
 
 # Con RTS/CTS (si está cableado)
@@ -180,14 +180,14 @@ pip3 install --upgrade pyserial
 
 ```bash
 # desde cualquier terminal conectada al puerto del servidor
-echo "<CAPTURAR:{size_name:THUMBNAIL}>" > /dev/ttyS0
+echo "<CAPTURAR:{size_name:THUMBNAIL}>" > /dev/serial0
 # servidor responde: OK|<size>  (guarda en /tmp/last.jpg)
 ```
 
 **Solo enviar la última foto:**
 
 ```bash
-echo "<ENVIAR:{path:LAST}>" > /dev/ttyS0
+echo "<ENVIAR:{path:LAST}>" > /dev/serial0
 # servidor responde OK|<size> y transmite por tamaño exacto
 ```
 
