@@ -17,6 +17,50 @@
 
 ---
 
+## Componentes electrónicos
+
+### servidor: 
+ * HW: Raspberry Pi Zero W 
+ * CAM: Raspberry Module 3 Wide  
+ * SO: Raspbian GNU/Linux 12 (bookworm))
+### cliente: 
+ * HW: Raspberry Pi 3 Model B 
+ * SO: Raspbian GNU/Linux 12 (bookworm))
+
+### Comunicación 
+
+# UART en Raspberry Pi — Pines GPIO
+
+## UART básico (sin RTS/CTS)
+
+| Función UART |  GPIO (BCM) |     Pin físico | Conectar a…            |
+| ------------ | ----------: | -------------: | ---------------------- |
+| TXD0         | **GPIO 14** |          **8** | **RX** del otro equipo |
+| RXD0         | **GPIO 15** |         **10** | **TX** del otro equipo |
+| GND          |           — | **6 / 9 / 14** | **GND** común          |
+
+## Con control de flujo por hardware (RTS/CTS habilitado)
+
+| Señal    |  GPIO (BCM) | Pin físico | Conectar a…             |
+| -------- | ----------: | ---------: | ----------------------- |
+| **RTS0** | **GPIO 17** |     **11** | **CTS** servidor        |
+| **CTS0** | **GPIO 16** |     **36** | **RTS** cliente         |
+
+**Notas:**
+
+* Niveles lógicos: **3.3 V** (TTL).
+* Cruce de líneas: **TX→RX**, **RX→TX**, y en HW flow **RTS↔CTS**.
+* `/dev/ttyS0` y `/dev/serial0` usan estos mismos GPIO por defecto.
+
+* Para habilitar RTS/CTS en Raspberry Pi importante activar  el firmware
+
+  - En /boot/firmware/config.txt (Bookworm) o /boot/config.txt (Bullseye y anteriores), agrega:
+   
+   ```
+	dtoverlay=uart0,ctsrts
+    ```
+	
+ 
 ## 📁 Estructura de carpetas
 
 ```

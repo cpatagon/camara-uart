@@ -1,9 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Servidor con RTS/CTS
+# ./init.sh server --port /dev/serial0 --baud 57600 --rtscts --sleep-ms 0
+
+# Cliente con RTS/CTS
+# ./init.sh client --port /dev/ttyS0 --baud 57600 --rtscts --resp-timeout 45
+
+
 # ---------------- Config por defecto (overrides con flags o env) ----------------
 MODE="${UART_MODE:-}"                # server|client (o vacío y se exige por CLI)
-PORT="${UART_PORT:-/dev/ttyS0}"      # en server usualmente /dev/serial0
+PORT="${UART_PORT:-/dev/serial0}"      # en server usualmente /dev/serial0
 BAUD="${UART_BAUD:-57600}"
 USE_CAMERA="${USE_CAMERA:-1}"        # 1 usa cámara, 0 no usa
 FALLBACK_IMAGE="${FALLBACK_IMAGE:-}" # ruta a JPG de respaldo
@@ -12,7 +19,7 @@ RESP_TIMEOUT="${RESP_TIMEOUT:-60}"   # timeout del cliente para esperar OK|size
 
 # Flow control (exclusivos): si ambos = 0, va sin flow control
 XONXOFF="${UART_XONXOFF:-0}"
-RTSCTS="${UART_RTSCTS:-0}"
+RTSCTS="${UART_RTSCTS:-1}"
 
 # ---------------- Utilidades ----------------
 SAY(){ printf "\033[1;32m[+] %s\033[0m\n" "$*"; }

@@ -246,7 +246,7 @@ class UARTPhotoClient:
 
 def main():
     parser = argparse.ArgumentParser(description='Cliente UART v4.1 - Recepción por tamaño exacto')
-    parser.add_argument('port', help='Puerto serial (ej: /dev/ttyS0)')
+    parser.add_argument('port', help='Puerto serial (ej: /dev/serial0)')
     parser.add_argument('--resp-timeout', type=int, default=45, help='Tiempo máx. para OK|size (seg)')
     parser.add_argument('--resolution', '-r', default='HD_READY',
                         help='Resolución: ULTRA_WIDE, FULL_HD, HD_READY, LOW_LIGHT, THUMBNAIL')

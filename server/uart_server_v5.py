@@ -40,7 +40,10 @@ def parse_command(line: str):
 def serve(port: str, baud: int, rtscts: bool, xonxoff: bool,
           use_camera: bool, fallback_image: str | None,
           inter_chunk_sleep_ms: int):
-    uart = UartTransport(port, baudrate=baud, rtscts=rtscts, xonxoff=xonxoff)
+    uart = UartTransport(port,
+                         baudrate=baud,
+                         rtscts=rtscts,
+                         xonxoff=xonxoff)
     if not uart.connect():
         return
 
