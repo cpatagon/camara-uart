@@ -1,39 +1,36 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
 """
-uart_server_v5.py — Servidor UART unificado con protocolo ACK
-- Migrado desde uart_server.py
-- Protocolo ACK bidireccional con retransmisión automática
-- APIs integradas: photo_api.py + transport_api.py
+uart_server_v5.py — Servidor con verificación ACK final
 """
-
 
 import argparse
 import logging
 import os, sys
 import re
+import time
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "APIs"))
 
 from photo_api import capture_photo, capture_to_file
-from transport_api import UartTransport
+from transport_api_ack import UartTransport
 
 # Log
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
-# Comandos (igual que antes)
+# Comandos
 RE_FOTO      = re.compile(r"^<FOTO:\{size_name:(\w+)\}>$")
 RE_CAPTURAR  = re.compile(r"^<CAPTURAR:\{size_name:(\w+)\}>$")
 RE_ENVIAR    = re.compile(r"^<ENVIAR:\{path:([^}]+)\}>$")
 
 RESP_OK  = "OK|"
 RESP_BAD = "BAD|"
+ACK_OK   = "ACK_OK"
+ACK_MISSING = "ACK_MISSING:"
 
 DEFAULT_LAST = "/tmp/last.jpg"
 
 def parse_command(line: str):
-    """Parseo de comandos (sin cambios)"""
     line = line.strip()
     m = RE_FOTO.match(line)
     if m: return ("FOTO", m.group(1))
@@ -43,16 +40,47 @@ def parse_command(line: str):
     if m: return ("ENVIAR", m.group(1))
     return (None, None)
 
-def serve(port: str, baud: int, rtscts: bool, xonxoff: bool,
-                use_camera: bool, fallback_image: str | None,
-                inter_chunk_sleep_ms: int):
-    """Servidor  con protocolo ACK"""
+def wait_for_ack(ser, expected_size, timeout=30):
+    """Esperar confirmación del cliente y manejar retransmisión"""
+    logging.info("📋 Esperando confirmación del cliente...")
+    deadline = time.time() + timeout
     
-    # CAMBIO PRINCIPAL: Usar UartTransport en lugar de UartTransport
+    while time.time() < deadline:
+        try:
+            line = ser.readline().decode("utf-8", errors="ignore").strip()
+            if not line:
+                continue
+                
+            logging.info(f"📨 Cliente responde: {line}")
+            
+            if line == ACK_OK:
+                logging.info("✅ Cliente confirmó recepción completa")
+                return True, 0
+            elif line.startswith(ACK_MISSING):
+                # Cliente reporta bytes faltantes: ACK_MISSING:1234
+                try:
+                    received = int(line.split(":")[1])
+                    missing = expected_size - received
+                    logging.warning(f"⚠️ Cliente reporta {missing} bytes faltantes")
+                    return False, missing
+                except:
+                    logging.error("❌ Formato ACK_MISSING inválido")
+                    return False, 0
+        except Exception as e:
+            logging.debug(f"Error leyendo ACK: {e}")
+            
+        time.sleep(0.1)
+    
+    logging.warning("⏰ Timeout esperando ACK del cliente")
+    return False, 0
+
+def serve(port: str, baud: int, rtscts: bool, xonxoff: bool,
+          use_camera: bool, fallback_image: str | None,
+          inter_chunk_sleep_ms: int):
     uart = UartTransport(port,
-                              baudrate=baud,
-                              rtscts=rtscts,
-                              xonxoff=xonxoff)
+                         baudrate=baud,
+                         rtscts=rtscts,
+                         xonxoff=xonxoff)
     if not uart.connect():
         return
 
@@ -60,9 +88,9 @@ def serve(port: str, baud: int, rtscts: bool, xonxoff: bool,
         ser = uart.ser  # acceso crudo para leer comandos
         assert ser is not None
 
-        logging.info("🟢 Servidor esperando comandos...")
+        logging.info("🟢 Esperando comandos...")
         while True:
-            # Leer comandos línea por línea
+            # leemos por línea (comandos terminan con CR/LF)
             line = ser.readline().decode("utf-8", errors="ignore")
             if not line:
                 continue
@@ -79,37 +107,26 @@ def serve(port: str, baud: int, rtscts: bool, xonxoff: bool,
                     size = os.path.getsize(DEFAULT_LAST)
                     ser.write(f"{RESP_OK}{size}\r\n".encode("utf-8"))
                     ser.flush()
-                    logging.info(f"✅ CAPTURAR exitoso: {size} bytes guardados")
                 else:
                     ser.write(f"{RESP_BAD}NO_IMAGE\r\n".encode("utf-8"))
                     ser.flush()
-                    logging.error("❌ CAPTURAR falló")
 
             elif cmd == "ENVIAR":
                 path = DEFAULT_LAST if arg == "LAST" else arg
                 if not os.path.isfile(path):
                     ser.write(f"{RESP_BAD}NO_FILE\r\n".encode("utf-8"))
                     ser.flush()
-                    logging.error(f"❌ ENVIAR: archivo no existe: {path}")
                     continue
-                    
                 size = os.path.getsize(path)
                 ser.write(f"{RESP_OK}{size}\r\n".encode("utf-8"))
                 ser.flush()
-                logging.info(f"📤 ENVIAR iniciado: {path} ({size} bytes)")
                 
-                # CAMBIO: Usar el método 
-                ok = uart.send_bytes(
-                    open(path, 'rb').read(),
-                    inter_chunk_sleep_ms=inter_chunk_sleep_ms,
-                    max_retries=2,
-                    wait_client_ready=True
-                )
-                
+                # Envío con verificación ACK
+                ok = uart.send_file_with_ack(path, size, inter_chunk_sleep_ms=inter_chunk_sleep_ms)
                 if ok:
-                    logging.info("🎉 ENVIAR  completado exitosamente")
+                    logging.info("🎉 ENVIAR OK verificado")
                 else:
-                    logging.error("❌ ENVIAR falló")
+                    logging.error("❌ ENVIAR falló verificación")
 
             elif cmd == "FOTO":
                 logging.info(f"📸 FOTO {arg} (capturar+enviar)")
@@ -117,64 +134,43 @@ def serve(port: str, baud: int, rtscts: bool, xonxoff: bool,
                 if not data:
                     ser.write(f"{RESP_BAD}NO_IMAGE\r\n".encode("utf-8"))
                     ser.flush()
-                    logging.error("❌ FOTO: no se pudo capturar imagen")
                     continue
-                
-                # Respuesta OK|size
+                    
+                # respuesta OK|size
                 ser.write(f"{RESP_OK}{len(data)}\r\n".encode("utf-8"))
                 ser.flush()
-                logging.info(f"📤 FOTO iniciado: captura de {len(data)} bytes")
                 
-                # CAMBIO: Usar envío 
-                ok = uart.send_bytes(
-                    data, 
-                    inter_chunk_sleep_ms=inter_chunk_sleep_ms,
-                    max_retries=2,
-                    wait_client_ready=True
-                )
-                
+                # Envío con verificación ACK
+                ok = uart.send_bytes_with_ack(data, len(data), inter_chunk_sleep_ms=inter_chunk_sleep_ms)
                 if ok:
-                    # Guardar como última imagen (para comando ENVIAR posterior)
+                    # actualizar last
                     try:
                         with open(DEFAULT_LAST, "wb") as f:
                             f.write(data)
-                        logging.debug(f"💾 Imagen guardada como última: {DEFAULT_LAST}")
-                    except Exception as e:
-                        logging.warning(f"⚠️ No se pudo guardar como última: {e}")
-                    
-                    logging.info("🎉 FOTO completada exitosamente")
+                    except:
+                        pass
+                    logging.info("🎉 FOTO OK verificado")
                 else:
-                    logging.error("❌ FOTO  falló")
+                    logging.error("❌ FOTO falló verificación")
                     
     except KeyboardInterrupt:
-        logging.info("🛑 Servidor detenido por usuario")
+        logging.info("🛑 Detenido por usuario")
     finally:
         uart.close()
 
 def main():
-    ap = argparse.ArgumentParser(description="Servidor UART con protocolo ACK")
+    ap = argparse.ArgumentParser(description="Servidor UART v5 con verificación ACK")
     ap.add_argument("port")
     ap.add_argument("-b", "--baud", type=int, default=57600)
     ap.add_argument("--rtscts", action="store_true")
     ap.add_argument("--xonxoff", action="store_true")
     ap.add_argument("--no-camera", dest="use_camera", action="store_false")
     ap.add_argument("--fallback-image")
-    ap.add_argument("--sleep-ms", type=int, default=1, 
-                    help="Pausa entre chunks (ms) - con protocolo es menos crítico")
+    ap.add_argument("--sleep-ms", type=int, default=0, help="Pausa entre chunks (ms)")
     args = ap.parse_args()
 
-    print("=" * 70)
-    print("🚀 SERVIDOR UART con eliminación de chunks problemáticos")
-    print("=" * 70)
-    print(f"Puerto: {args.port} @ {args.baud} baud")
-    print(f"Flow control: RTS/CTS={args.rtscts}, XON/XOFF={args.xonxoff}")
-    print(f"Cámara: {'SÍ' if args.use_camera else 'NO'}")
-    print(f"Fallback: {args.fallback_image or 'Ninguno'}")
-    print(f"Sleep entre chunks: {args.sleep_ms}ms")
-    print("=" * 70)
-
     serve(args.port, args.baud, args.rtscts, args.xonxoff,
-                args.use_camera, args.fallback_image, args.sleep_ms)
+          args.use_camera, args.fallback_image, args.sleep_ms)
 
 if __name__ == "__main__":
     main()

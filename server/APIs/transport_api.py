@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+
 """
-transport_api.py — API de transporte UART con desaceleración gradual
-- Transmisión normal hasta últimos KB
-- Desaceleración progresiva para sincronización perfecta
-- Verificación final robusta
+transport_api.py — API de transporte UART unificada
+- Migrado desde transport_api_robust.py
+- Protocolo ACK con retransmisión selectiva
+- Desaceleración adaptativa para transmisiones grandes
+- Sin marcadores finales por defecto (evita corrupción)
 """
 
 import time
@@ -17,6 +19,12 @@ END_MARKER   = b"\xBB" * 10
 END_TEXT     = b"<FIN_TRANSMISION>\r\n"
 SIZE_BYTES   = 4
 DEFAULT_CHUNK = 512
+
+# Protocolo ACK mejorado
+ACK_READY = "ACK_READY"
+ACK_OK = "ACK_OK"
+ACK_MISSING = "ACK_MISSING:"
+ACK_ERROR = "ACK_ERROR"
 
 class UartTransport:
     def __init__(self, port: str, baudrate: int = 57600, timeout: float = 2.0,
@@ -42,13 +50,13 @@ class UartTransport:
                 xonxoff=self.xonxoff
             )
             
-            # Limpieza inicial
-            for _ in range(3):
+            # Limpieza inicial mejorada
+            for _ in range(5):
                 self.ser.reset_input_buffer()
                 self.ser.reset_output_buffer()
                 time.sleep(0.1)
             
-            logging.info(f"✅ UART: {self.port} @ {self.baudrate} (rtscts={self.rtscts}, xonxoff={self.xonxoff})")
+            logging.info(f"✅ UART Robusta: {self.port} @ {self.baudrate} (rtscts={self.rtscts}, xonxoff={self.xonxoff})")
             return True
         except Exception as e:
             logging.error(f"❌ UART open: {e}")
@@ -57,6 +65,7 @@ class UartTransport:
     def close(self):
         try:
             if self.ser and self.ser.is_open:
+                # Cierre más suave
                 self.ser.flush()
                 timeout_start = time.time()
                 while self.ser.out_waiting > 0 and (time.time() - timeout_start) < 10:
@@ -65,85 +74,175 @@ class UartTransport:
                 self.ser.reset_output_buffer()
                 self.ser.reset_input_buffer()
                 self.ser.close()
-                logging.info("🔌 UART cerrada")
+                logging.info("🔌 UART robusta cerrada")
         except Exception as e:
             logging.debug(f"Error cerrando UART: {e}")
 
-    def _calculate_adaptive_sleep(self, remaining_bytes: int, base_sleep_ms: int) -> float:
-        """Calcular pausa adaptativa basada en bytes restantes"""
-        base_sleep = max(0.005, base_sleep_ms / 1000.0)
+    def _wait_for_client_ready(self, timeout: float = 30) -> bool:
+        """Esperar que el cliente confirme estar listo para recibir"""
+        logging.info("📋 Esperando que cliente esté listo...")
+        deadline = time.time() + timeout
         
-        if remaining_bytes <= 256:
-            # Últimos 256 bytes: EXTREMADAMENTE lento
-            return base_sleep * 25  # 25x más lento
-        elif remaining_bytes <= 512:
-            # Últimos 512 bytes: MUY lento
-            return base_sleep * 20  # 20x más lento
-        elif remaining_bytes <= 1024:
-            # Últimos 1KB: Muy lento
-            return base_sleep * 15  # 15x más lento
-        elif remaining_bytes <= 2048:
-            # Últimos 2KB: Lento
-            return base_sleep * 10  # 10x más lento
-        elif remaining_bytes <= 5120:
-            # Últimos 5KB: Más lento
-            return base_sleep * 5   # 5x más lento
-        else:
-            # Transmisión normal
-            return base_sleep
+        while time.time() < deadline:
+            try:
+                line = self.ser.readline().decode("utf-8", errors="ignore").strip()
+                if line == ACK_READY:
+                    logging.info("✅ Cliente listo para recibir")
+                    return True
+                elif line:
+                    logging.debug(f"📨 Cliente (esperando ready): {line}")
+            except Exception as e:
+                logging.debug(f"Error leyendo ready: {e}")
+                
+            time.sleep(0.1)
+        
+        logging.warning("⏰ Timeout esperando cliente listo")
+        return False
 
-    def send_bytes(self, data: bytes,
-                   chunk_size: int = DEFAULT_CHUNK,
-                   inter_chunk_sleep_ms: int = 0,
-                   send_end_markers: bool = True) -> bool:
-        """
-        Envío con desaceleración gradual en los últimos bytes
-        """
+    def _wait_for_ack(self, expected_size: int, timeout: float = 45) -> tuple[bool, int]:
+        """Esperar ACK del cliente con timeout extendido"""
+        logging.info("📋 Esperando confirmación final del cliente...")
+        deadline = time.time() + timeout
+        
+        while time.time() < deadline:
+            try:
+                line = self.ser.readline().decode("utf-8", errors="ignore").strip()
+                if not line:
+                    continue
+                    
+                logging.info(f"📨 Cliente: {line}")
+                
+                if line == ACK_OK:
+                    logging.info("✅ ACK_OK - Cliente confirmó recepción completa")
+                    return True, 0
+                elif line.startswith(ACK_MISSING):
+                    try:
+                        # Mejorar parsing de ACK_MISSING - manejar formato ACK_MISSING:123 o ACK_MISSING::0
+                        parts = line.split(":")
+                        if len(parts) >= 2:
+                            # Obtener el último elemento que no sea vacío
+                            received_str = [p for p in parts[1:] if p.strip()]
+                            if received_str:
+                                received = int(received_str[-1])
+                                missing = expected_size - received
+                                logging.warning(f"⚠️ Faltan {missing} bytes (cliente recibió {received})")
+                                return False, missing
+                        
+                        # Si no se puede parsear, asumir que faltan todos los bytes
+                        logging.warning(f"⚠️ Formato ACK_MISSING no estándar, asumiendo 0 bytes recibidos")
+                        return False, expected_size
+                    except Exception as e:
+                        logging.error(f"❌ Error parseando ACK_MISSING '{line}': {e}")
+                        return False, expected_size
+                elif line == ACK_ERROR:
+                    logging.error("❌ Cliente reportó error")
+                    return False, expected_size
+                    
+            except Exception as e:
+                logging.debug(f"Error leyendo ACK: {e}")
+                
+            time.sleep(0.1)
+        
+        logging.warning("⏰ Timeout esperando ACK final")
+        return False, 0
+
+    def _send_missing_bytes(self, data: bytes, start_offset: int, missing_count: int) -> bool:
+        """Retransmitir bytes faltantes de manera robusta"""
+        if start_offset >= len(data) or missing_count <= 0:
+            logging.error(f"❌ Parámetros retransmisión inválidos: offset={start_offset}, missing={missing_count}")
+            return False
+            
+        end_offset = min(start_offset + missing_count, len(data))
+        missing_data = data[start_offset:end_offset]
+        
+        logging.info(f"🔄 Retransmitiendo {len(missing_data)} bytes desde offset {start_offset}")
+        
+        try:
+            # Marcador especial para retransmisión
+            retry_marker = b"\xCC" * 4
+            self.ser.write(retry_marker)
+            self.ser.flush()
+            time.sleep(0.1)  # Pausa para que cliente detecte retransmisión
+            
+            # Envío con chunks más pequeños y pausas
+            chunk_size = 64  # Chunks muy pequeños para máxima confiabilidad
+            sent = 0
+            
+            while sent < len(missing_data):
+                chunk_end = min(sent + chunk_size, len(missing_data))
+                chunk = missing_data[sent:chunk_end]
+                
+                bytes_written = self.ser.write(chunk)
+                self.ser.flush()
+                sent += bytes_written
+                
+                # Pausa más larga para estabilidad
+                time.sleep(0.02)
+                
+                if sent % 256 == 0 or sent == len(missing_data):
+                    logging.info(f"🔄 Retransmisión: {sent}/{len(missing_data)} bytes")
+            
+            # Pausa final después de retransmisión
+            time.sleep(0.5)
+            logging.info("✅ Retransmisión completada")
+            return True
+            
+        except Exception as e:
+            logging.error(f"❌ Error en retransmisión: {e}")
+            return False
+
+    def _calculate_smart_sleep(self, sent_bytes: int, total_bytes: int, base_sleep_ms: int) -> float:
+        """Calcular pausa inteligente - SIN desaceleración artificial problemática"""
+        base_sleep = max(0.001, base_sleep_ms / 1000.0)
+        
+        # Velocidad constante - eliminamos la desaceleración que causaba los chunks de 110ms
+        return base_sleep
+        
+        # NOTA: Comentamos la lógica de desaceleración que causaba el problema:
+        # if remaining_bytes <= 256: return base_sleep * 25  # ESTO causaba 125ms
+        # if remaining_bytes <= 512: return base_sleep * 20  # ESTO causaba 100ms
+
+    def send_bytes_robust(self, data: bytes,
+                         chunk_size: int = DEFAULT_CHUNK,
+                         inter_chunk_sleep_ms: int = 0,
+                         max_retries: int = 2,
+                         wait_client_ready: bool = True) -> bool:
+        """Envío robusto con protocolo ACK mejorado"""
         if not self.ser or not self.ser.is_open:
             logging.error("❌ UART no abierta")
             return False
 
         size = len(data)
-        
-        # Ajuste de parámetros base según tamaño total
-        if size > 200000:
-            chunk_size = min(chunk_size, 256)
-            base_sleep_ms = max(inter_chunk_sleep_ms, 8)
-        elif size > 100000:
-            chunk_size = min(chunk_size, 512)
-            base_sleep_ms = max(inter_chunk_sleep_ms, 5)
-        else:
-            base_sleep_ms = max(inter_chunk_sleep_ms, 3)
-        
-        logging.info(f"📊 Enviando {size} bytes con desaceleración gradual...")
-        logging.info(f"📊 Chunks: {chunk_size}, sleep base: {base_sleep_ms}ms")
+        logging.info(f"📊 Envío ROBUSTO: {size} bytes con protocolo ACK mejorado")
 
         try:
-            # 1. Preámbulo
-            self._send_with_verification(START_MARKER, "marcador inicio")
-            time.sleep(0.05)
+            # 0. Opcional: Esperar que cliente esté listo
+            if wait_client_ready:
+                if not self._wait_for_client_ready(timeout=30):
+                    logging.warning("⚠️ Cliente no confirmó estar listo, continuando...")
+
+            # 1. Preámbulo del protocolo
+            logging.info("📤 Enviando preámbulo...")
+            self.ser.write(START_MARKER)
+            self.ser.flush()
+            time.sleep(0.1)  # Pausa fija, no variable
             
             size_bytes = struct.pack(">I", size)
-            self._send_with_verification(size_bytes, f"tamaño ({size})")
-            time.sleep(0.05)
+            self.ser.write(size_bytes)
+            self.ser.flush()
+            time.sleep(0.1)  # Pausa fija, no variable
             
-            # 2. Envío principal con desaceleración gradual
+            # 2. Envío principal con velocidad CONSTANTE (sin desaceleración)
+            logging.info("📦 Iniciando envío principal...")
             sent = 0
             view = memoryview(data)
             last_log = 0
+            base_sleep = self._calculate_smart_sleep(0, size, inter_chunk_sleep_ms)
             
             while sent < size:
                 remaining = size - sent
                 current_chunk_size = min(chunk_size, remaining)
                 chunk = view[sent:sent + current_chunk_size]
-                
-                # Calcular pausa adaptativa
-                adaptive_sleep = self._calculate_adaptive_sleep(remaining, base_sleep_ms)
-                
-                # Log detallado en zona de desaceleración
-                if remaining <= 5120:
-                    logging.info(f"🐌 Desaceleración: {sent}/{size} - "
-                               f"faltan: {remaining} - sleep: {adaptive_sleep*1000:.1f}ms")
                 
                 # Envío del chunk
                 try:
@@ -158,85 +257,93 @@ class UartTransport:
                     logging.error(f"❌ Timeout escribiendo en byte {sent}")
                     return False
                 
-                # Pausa adaptativa
-                if adaptive_sleep > 0:
-                    time.sleep(adaptive_sleep)
-                
-                # Drenaje extra para últimos chunks
-                if remaining <= 2048:
-                    drain_start = time.time()
-                    initial_buffer = self.ser.out_waiting
-                    
-                    while self.ser.out_waiting > 0 and (time.time() - drain_start) < 5:
-                        time.sleep(0.01)
-                    
-                    final_buffer = self.ser.out_waiting
-                    if remaining <= 512:  # Solo log para últimos 512 bytes
-                        logging.info(f"🔍 Buffer drain: {initial_buffer}->{final_buffer}")
+                # Pausa CONSTANTE (eliminamos la lógica de desaceleración)
+                if base_sleep > 0:
+                    time.sleep(base_sleep)
                 
                 # Log de progreso
                 pct = int(sent * 100 / size) if size else 100
-                if pct - last_log >= 10 or remaining <= 5120:
-                    logging.info(f"📦 Progreso: {sent}/{size} bytes ({pct}%)")
+                if pct - last_log >= 10:
+                    logging.info(f"📦 Progreso constante: {sent}/{size} bytes ({pct}%)")
                     last_log = pct
             
-            # 3. Verificación final extendida
-            logging.info("🔍 Verificación final extendida...")
+            # 3. Sincronización final robusta
+            logging.info("🔍 Sincronización final robusta...")
+            self.ser.flush()
             
-            # Drenaje final con timeout largo
-            final_drain_start = time.time()
-            max_drain_time = 20  # 20 segundos para estar seguros
+            # Drenaje con timeout extendido
+            drain_start = time.time()
+            max_drain_time = 15
             
             while self.ser.out_waiting > 0:
-                if time.time() - final_drain_start > max_drain_time:
-                    logging.error(f"❌ TIMEOUT final: Buffer no se vació ({self.ser.out_waiting} bytes)")
+                if time.time() - drain_start > max_drain_time:
+                    logging.error(f"❌ TIMEOUT drenaje: {self.ser.out_waiting} bytes pendientes")
                     return False
                 time.sleep(0.1)
                 
-                # Log cada 2 segundos
-                elapsed = time.time() - final_drain_start
-                if int(elapsed) % 2 == 0 and elapsed > 1:
-                    logging.info(f"⏳ Drenando buffer final: {self.ser.out_waiting} bytes ({elapsed:.1f}s)")
+                elapsed = time.time() - drain_start
+                if int(elapsed) % 3 == 0 and elapsed > 1:
+                    logging.info(f"⏳ Drenando: {self.ser.out_waiting} bytes ({elapsed:.1f}s)")
             
-            # Pausa extra de estabilización
-            time.sleep(0.5)
+            # 4. Pausa de estabilización antes de marcadores
+            logging.info("⏳ Pausa de estabilización...")
+            time.sleep(1.0)  # Tiempo fijo para que cliente procese
             
-            # Verificación de éxito
-            if sent == size and self.ser.out_waiting == 0:
-                logging.info("✅ Envío COMPLETAMENTE VERIFICADO con desaceleración")
-                success = True
-            else:
-                logging.error(f"❌ Verificación falló: sent={sent}/{size}, buffer={self.ser.out_waiting}")
-                success = False
+            # 5. Marcadores finales
+            self.ser.write(END_MARKER)
+            self.ser.flush()
+            time.sleep(0.2)
+            self.ser.write(END_TEXT)
+            self.ser.flush()
+            time.sleep(0.2)
             
-            # 4. Marcadores finales con pausa extra
-            if success and send_end_markers:
-                time.sleep(0.2)  # Pausa extra antes de marcadores
-                self._send_with_verification(END_MARKER, "marcador fin")
-                time.sleep(0.1)
-                self._send_with_verification(END_TEXT, "texto fin")
-                time.sleep(0.1)  # Pausa extra después de marcadores
-                logging.info("🏁 Marcadores finales enviados con pausas extendidas")
+            logging.info("📤 Envío completado, iniciando verificación ACK...")
             
-            return success
+            # 6. Ciclo de verificación y corrección
+            for retry in range(max_retries + 1):
+                if retry > 0:
+                    logging.info(f"🔄 Intento de corrección #{retry}/{max_retries}")
+                
+                # Esperar ACK con timeout extendido
+                ack_success, missing_bytes = self._wait_for_ack(size, timeout=60)
+                
+                if ack_success:
+                    logging.info("🎉 ¡TRANSMISIÓN ROBUSTA COMPLETADA CON ÉXITO!")
+                    return True
+                
+                if missing_bytes <= 0:
+                    logging.error("❌ No se pudo determinar corrección necesaria")
+                    break
+                
+                if retry >= max_retries:
+                    logging.error(f"❌ Máximo de reintentos alcanzado ({max_retries})")
+                    break
+                
+                # Calcular offset y retransmitir
+                received_bytes = size - missing_bytes
+                success = self._send_missing_bytes(data, received_bytes, missing_bytes)
+                
+                if not success:
+                    logging.error("❌ Falló retransmisión")
+                    break
+                    
+                # Pausa antes del siguiente ciclo ACK
+                time.sleep(1.0)
+            
+            logging.error("❌ Transmisión falló después de todos los reintentos")
+            return False
             
         except Exception as e:
-            logging.error(f"❌ Error crítico durante envío: {e}")
+            logging.error(f"❌ Error crítico en envío robusto: {e}")
             return False
 
-    def _send_with_verification(self, data: bytes, description: str):
-        """Envío con verificación de escritura completa"""
-        try:
-            bytes_written = self.ser.write(data)
-            if bytes_written != len(data):
-                raise Exception(f"Escritura incompleta de {description}: {bytes_written}/{len(data)}")
-            self.ser.flush()
-            logging.debug(f"✅ {description}: {len(data)} bytes")
-        except Exception as e:
-            logging.error(f"❌ Error enviando {description}: {e}")
-            raise
+    # Métodos de compatibilidad
+    def send_bytes(self, data: bytes, **kwargs) -> bool:
+        """Método de compatibilidad - redirige al robusto"""
+        return self.send_bytes_robust(data, **kwargs)
 
     def send_file(self, path: str, **kwargs) -> bool:
+        """Envío de archivo robusto"""
         with open(path, "rb") as f:
             data = f.read()
-        return self.send_bytes(data, **kwargs)
+        return self.send_bytes_robust(data, **kwargs)

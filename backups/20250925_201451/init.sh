@@ -1,23 +1,22 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Versión ROBUSTA del init.sh que usa las APIs mejoradas
+
+
+
+
 # ---------------- Config por defecto (overrides con flags o env) ----------------
 MODE="${UART_MODE:-}"                # server|client (o vacío y se exige por CLI)
 PORT="${UART_PORT:-/dev/serial0}"      # en server usualmente /dev/serial0
 BAUD="${UART_BAUD:-57600}"
 USE_CAMERA="${USE_CAMERA:-1}"        # 1 usa cámara, 0 no usa
 FALLBACK_IMAGE="${FALLBACK_IMAGE:-}" # ruta a JPG de respaldo
-SLEEP_MS="${SERVER_SLEEP_MS:-1}"     # pausa entre chunks (menos crítico con protocolo robusto)
-RESP_TIMEOUT="${RESP_TIMEOUT:-60}"   # timeout del cliente para esperar OK|size (más largo)
+SLEEP_MS="${SERVER_SLEEP_MS:-0}"     # pausa entre chunks en el server
+RESP_TIMEOUT="${RESP_TIMEOUT:-60}"   # timeout del cliente para esperar OK|size
 
 # Flow control (exclusivos): si ambos = 0, va sin flow control
 XONXOFF="${UART_XONXOFF:-0}"
 RTSCTS="${UART_RTSCTS:-1}"
-
-# Nuevas opciones robustas
-ENABLE_ACK="${ENABLE_ACK:-1}"        # 1 habilita protocolo ACK, 0 lo deshabilita
-MAX_RETRIES="${MAX_RETRIES:-2}"      # número máximo de reintentos
 
 # ---------------- Utilidades ----------------
 SAY(){ printf "\033[1;32m[+] %s\033[0m\n" "$*"; }
@@ -28,7 +27,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 usage() {
   cat <<EOF
-🚀 UART ROBUSTO - Uso:
+Uso:
   $(basename "$0") server [opciones]
   $(basename "$0") client [opciones]
 
@@ -41,25 +40,16 @@ Opciones comunes:
 Opciones servidor:
   --no-camera          (no usar cámara, sólo fallback)
   --fallback PATH.jpg  (imagen de respaldo)
-  --sleep-ms N         (pausa entre chunks; default ${SLEEP_MS}ms - menos crítico con protocolo robusto)
+  --sleep-ms N         (pausa entre chunks; mitiga pérdidas sin flow control)
 
 Opciones cliente:
   --resp-timeout N     (segundos para esperar OK|size; default ${RESP_TIMEOUT})
   --resolution NAME    (THUMBNAIL | LOW_LIGHT | HD_READY | FULL_HD | ULTRA_WIDE)
   --output PATH.jpg    (ruta de salida)
-  --no-ack             (deshabilitar protocolo ACK - no recomendado)
-
-🎯 Mejoras robustas:
-  • Eliminación de chunks problemáticos de 110ms
-  • Protocolo ACK bidireccional con retransmisión
-  • Sincronización mejorada servidor-cliente
-  • Verificación de integridad JPEG
-  • Timeouts extendidos para mayor confiabilidad
 
 Variables de entorno equivalentes:
   UART_MODE=server|client, UART_PORT, UART_BAUD, UART_XONXOFF=0/1, UART_RTSCTS=0/1
   USE_CAMERA=1/0, FALLBACK_IMAGE=path, SERVER_SLEEP_MS, RESP_TIMEOUT
-  ENABLE_ACK=1/0, MAX_RETRIES=N
 EOF
 }
 
@@ -80,8 +70,6 @@ while [[ $# -gt 0 ]]; do
     --resp-timeout)RESP_TIMEOUT="${2:?}"; shift 2 ;;
     --resolution)  RESOLUTION="${2:?}"; shift 2 ;;
     --output)      OUTPUT_PATH="${2:?}"; shift 2 ;;
-    --no-ack)      ENABLE_ACK=0; shift ;;
-    --max-retries) MAX_RETRIES="${2:?}"; shift 2 ;;
     -h|--help)     usage; exit 0 ;;
     *) ERR "Flag desconocida: $1"; usage; exit 1 ;;
   esac
@@ -100,80 +88,36 @@ FLOW_FLAGS=()
 [[ "${XONXOFF}" == "1" ]] && FLOW_FLAGS+=(--xonxoff)
 [[ "${RTSCTS}" == "1" ]] && FLOW_FLAGS+=(--rtscts)
 
-# ---------------- Verificación de archivos robustos ----------------
-check_robust_files() {
-  local missing_files=()
-  
-  if [[ "${MODE}" == "server" ]]; then
-    if [[ ! -f "${SCRIPT_DIR}/server/APIs/transport_api_robust.py" ]]; then
-      missing_files+=("server/APIs/transport_api_robust.py")
-    fi
-    if [[ ! -f "${SCRIPT_DIR}/server/uart_server_robust.py" ]]; then
-      missing_files+=("uart_server_robust.py")
-    fi
-  elif [[ "${MODE}" == "client" ]]; then
-    if [[ ! -f "${SCRIPT_DIR}/client/uart_client_robust.py" ]]; then
-      missing_files+=("uart_client_robust.py")
-    fi
-  fi
-  
-  if [[ ${#missing_files[@]} -gt 0 ]]; then
-    ERR "❌ Faltan archivos robustos:"
-    for file in "${missing_files[@]}"; do
-      ERR "   • ${file}"
-    done
-    WARN "💡 Crea los archivos robustos antes de continuar."
-    WARN "💡 O usa el init.sh original para la versión estándar."
-    exit 1
-  fi
-}
-
-# ---------------- Comandos robustos ----------------
-run_server_robust() {
-  SAY "🚀 Iniciando SERVIDOR ROBUSTO en ${PORT} @ ${BAUD}"
-  SAY "Flow control: ${FLOW_FLAGS[*]:-none}"
-  SAY "Protocolo ACK: $([ "${ENABLE_ACK}" == "1" ] && echo "HABILITADO" || echo "deshabilitado")"
-  
+# ---------------- Comandos ----------------
+run_server() {
+  SAY "Iniciando servidor en ${PORT} @ ${BAUD} (flow: ${FLOW_FLAGS[*]:-none})"
   local no_cam_flag=()
   [[ "${USE_CAMERA}" == "0" ]] && no_cam_flag+=(--no-camera)
   local fb_flag=()
   [[ -n "${FALLBACK_IMAGE}" ]] && fb_flag+=(--fallback-image "${FALLBACK_IMAGE}")
 
-  # Exportar variables para el servidor
-  export ENABLE_ACK MAX_RETRIES
-
-  exec python3 "${SCRIPT_DIR}/server/uart_server_robust.py" \
+  exec python3 "${SCRIPT_DIR}/server/uart_server_v5.py" \
       "${PORT}" -b "${BAUD}" "${FLOW_FLAGS[@]}" \
       "${no_cam_flag[@]}" "${fb_flag[@]}" \
       --sleep-ms "${SLEEP_MS}"
 }
 
-run_client_robust() {
-  SAY "🚀 Iniciando CLIENTE ROBUSTO en ${PORT} @ ${BAUD}"
-  SAY "Flow control: ${FLOW_FLAGS[*]:-none}"
-  SAY "Protocolo ACK: $([ "${ENABLE_ACK}" == "1" ] && echo "HABILITADO" || echo "deshabilitado")"
-  SAY "Timeout respuesta: ${RESP_TIMEOUT}s (extendido para robustez)"
-  
+run_client() {
+  SAY "Iniciando cliente en ${PORT} @ ${BAUD} (flow: ${FLOW_FLAGS[*]:-none})"
   local res_flag=(-r "${RESOLUTION:-THUMBNAIL}")
   local out_flag=()
   [[ -n "${OUTPUT_PATH:-}" ]] && out_flag+=(--output "${OUTPUT_PATH}")
-  local ack_flag=()
-  [[ "${ENABLE_ACK}" == "0" ]] && ack_flag+=(--no-ack)
 
-  # Exportar variables para el cliente
-  export RESP_TIMEOUT ENABLE_ACK
+  # export para que el script pueda leer RESP_TIMEOUT si lo soporta
+  export RESP_TIMEOUT
 
-  exec python3 "${SCRIPT_DIR}/client/uart_client_robust.py" \
+  exec python3 "${SCRIPT_DIR}/client/uart_client_v5.py" \
       "${PORT}" -b "${BAUD}" "${FLOW_FLAGS[@]}" \
-      "${res_flag[@]}" "${out_flag[@]}" "${ack_flag[@]}" \
-      --resp-timeout "${RESP_TIMEOUT}"
+      "${res_flag[@]}" "${out_flag[@]}"
 }
 
-# ---------------- Función principal ----------------
-check_robust_files
-
 case "${MODE}" in
-  server) run_server_robust ;;
-  client) run_client_robust ;;
+  server) run_server ;;
+  client) run_client ;;
   *) ERR "Modo inválido: ${MODE}"; usage; exit 1 ;;
 esac

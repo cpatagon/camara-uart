@@ -1,20 +1,25 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# ============================================================================
+# init.sh — Script unificado para sistema de cámara UART
+# Versión unificada con protocolo ACK robusto
+# ============================================================================
 
-
-
-
-# ---------------- Config por defecto (overrides con flags o env) ----------------
-MODE="${UART_MODE:-}"                # server|client (o vacío y se exige por CLI)
-PORT="${UART_PORT:-/dev/serial0}"      # en server usualmente /dev/serial0
+# ---------------- Config por defecto ----------------
+MODE="${UART_MODE:-}"
+PORT="${UART_PORT:-/dev/serial0}"
 BAUD="${UART_BAUD:-57600}"
-USE_CAMERA="${USE_CAMERA:-1}"        # 1 usa cámara, 0 no usa
-FALLBACK_IMAGE="${FALLBACK_IMAGE:-}" # ruta a JPG de respaldo
-SLEEP_MS="${SERVER_SLEEP_MS:-0}"     # pausa entre chunks en el server
-RESP_TIMEOUT="${RESP_TIMEOUT:-60}"   # timeout del cliente para esperar OK|size
+USE_CAMERA="${USE_CAMERA:-1}"
+FALLBACK_IMAGE="${FALLBACK_IMAGE:-}"
+SLEEP_MS="${SERVER_SLEEP_MS:-0}"
+RESP_TIMEOUT="${RESP_TIMEOUT:-60}"
 
-# Flow control (exclusivos): si ambos = 0, va sin flow control
+# Protocol ACK (habilitado por defecto)
+ENABLE_ACK="${ENABLE_ACK:-1}"
+MAX_RETRIES="${MAX_RETRIES:-2}"
+
+# Flow control
 XONXOFF="${UART_XONXOFF:-0}"
 RTSCTS="${UART_RTSCTS:-1}"
 
@@ -27,29 +32,41 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 usage() {
   cat <<EOF
+Sistema de Cámara UART - Versión Unificada con Protocolo ACK
+
 Uso:
   $(basename "$0") server [opciones]
   $(basename "$0") client [opciones]
 
 Opciones comunes:
-  --port PATH          (default: ${PORT})
-  --baud N             (default: ${BAUD})
-  --xonxoff            (habilita XON/XOFF)
-  --rtscts             (habilita RTS/CTS; no usar junto con --xonxoff)
+  --port PATH          Puerto serie (default: ${PORT})
+  --baud N             Velocidad (default: ${BAUD})
+  --xonxoff            Habilitar XON/XOFF
+  --rtscts             Habilitar RTS/CTS (default: habilitado)
 
 Opciones servidor:
-  --no-camera          (no usar cámara, sólo fallback)
-  --fallback PATH.jpg  (imagen de respaldo)
-  --sleep-ms N         (pausa entre chunks; mitiga pérdidas sin flow control)
+  --no-camera          Usar solo imagen fallback
+  --fallback PATH.jpg  Imagen de respaldo
+  --sleep-ms N         Pausa entre chunks (default: ${SLEEP_MS})
 
 Opciones cliente:
-  --resp-timeout N     (segundos para esperar OK|size; default ${RESP_TIMEOUT})
-  --resolution NAME    (THUMBNAIL | LOW_LIGHT | HD_READY | FULL_HD | ULTRA_WIDE)
-  --output PATH.jpg    (ruta de salida)
+  --resp-timeout N     Timeout respuesta servidor (default: ${RESP_TIMEOUT}s)
+  --resolution NAME    Resolución: THUMBNAIL|LOW_LIGHT|HD_READY|FULL_HD|ULTRA_WIDE
+  --output PATH.jpg    Archivo de salida
+  --no-ack            Deshabilitar protocolo ACK (no recomendado)
+  --max-retries N     Máximo reintentos (default: ${MAX_RETRIES})
 
-Variables de entorno equivalentes:
-  UART_MODE=server|client, UART_PORT, UART_BAUD, UART_XONXOFF=0/1, UART_RTSCTS=0/1
-  USE_CAMERA=1/0, FALLBACK_IMAGE=path, SERVER_SLEEP_MS, RESP_TIMEOUT
+Ejemplos:
+  # Servidor con RTS/CTS:
+  $(basename "$0") server --port /dev/serial0 --baud 57600 --rtscts
+
+  # Cliente con resolución Full HD:
+  $(basename "$0") client --resolution FULL_HD --output foto_hd.jpg
+
+Variables de entorno:
+  UART_MODE, UART_PORT, UART_BAUD, UART_RTSCTS, UART_XONXOFF
+  USE_CAMERA, FALLBACK_IMAGE, SERVER_SLEEP_MS, RESP_TIMEOUT
+  ENABLE_ACK, MAX_RETRIES
 EOF
 }
 
@@ -62,14 +79,16 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --port)        PORT="${2:?}"; shift 2 ;;
     --baud)        BAUD="${2:?}"; shift 2 ;;
-    --xonxoff)     XONXOFF=1; shift ;;
-    --rtscts)      RTSCTS=1; shift ;;
+    --xonxoff)     XONXOFF=1; RTSCTS=0; shift ;;
+    --rtscts)      RTSCTS=1; XONXOFF=0; shift ;;
     --no-camera)   USE_CAMERA=0; shift ;;
     --fallback)    FALLBACK_IMAGE="${2:?}"; shift 2 ;;
     --sleep-ms)    SLEEP_MS="${2:?}"; shift 2 ;;
     --resp-timeout)RESP_TIMEOUT="${2:?}"; shift 2 ;;
     --resolution)  RESOLUTION="${2:?}"; shift 2 ;;
     --output)      OUTPUT_PATH="${2:?}"; shift 2 ;;
+    --no-ack)      ENABLE_ACK=0; shift ;;
+    --max-retries) MAX_RETRIES="${2:?}"; shift 2 ;;
     -h|--help)     usage; exit 0 ;;
     *) ERR "Flag desconocida: $1"; usage; exit 1 ;;
   esac
@@ -80,6 +99,7 @@ if [[ -z "${MODE}" ]]; then
   usage; exit 1
 fi
 
+# Validar flow control
 if [[ "${XONXOFF}" == "1" && "${RTSCTS}" == "1" ]]; then
   ERR "No uses --xonxoff y --rtscts juntos"; exit 1
 fi
@@ -88,13 +108,41 @@ FLOW_FLAGS=()
 [[ "${XONXOFF}" == "1" ]] && FLOW_FLAGS+=(--xonxoff)
 [[ "${RTSCTS}" == "1" ]] && FLOW_FLAGS+=(--rtscts)
 
+# ---------------- Verificación de archivos ----------------
+check_files() {
+  local missing_files=()
+  
+  if [[ "${MODE}" == "server" ]]; then
+    [[ ! -f "${SCRIPT_DIR}/server/APIs/transport_api.py" ]] && missing_files+=("server/APIs/transport_api.py")
+    [[ ! -f "${SCRIPT_DIR}/server/APIs/photo_api.py" ]] && missing_files+=("server/APIs/photo_api.py")
+    [[ ! -f "${SCRIPT_DIR}/server/uart_server_v5.py" ]] && missing_files+=("server/uart_server_v5.py")
+  elif [[ "${MODE}" == "client" ]]; then
+    [[ ! -f "${SCRIPT_DIR}/client/uart_client_v5.py" ]] && missing_files+=("client/uart_client_v5.py")
+  fi
+  
+  if [[ ${#missing_files[@]} -gt 0 ]]; then
+    ERR "❌ Faltan archivos necesarios:"
+    for file in "${missing_files[@]}"; do
+      ERR "   • ${file}"
+    done
+    exit 1
+  fi
+}
+
 # ---------------- Comandos ----------------
 run_server() {
-  SAY "Iniciando servidor en ${PORT} @ ${BAUD} (flow: ${FLOW_FLAGS[*]:-none})"
+  SAY "🚀 Iniciando SERVIDOR UART con protocolo ACK"
+  SAY "Puerto: ${PORT} @ ${BAUD} bauds"
+  SAY "Flow control: ${FLOW_FLAGS[*]:-ninguno}"
+  SAY "Protocolo ACK: $([ "${ENABLE_ACK}" == "1" ] && echo "✅ HABILITADO" || echo "⚠️ deshabilitado")"
+  
   local no_cam_flag=()
   [[ "${USE_CAMERA}" == "0" ]] && no_cam_flag+=(--no-camera)
   local fb_flag=()
   [[ -n "${FALLBACK_IMAGE}" ]] && fb_flag+=(--fallback-image "${FALLBACK_IMAGE}")
+
+  # Exportar variables para el servidor
+  export ENABLE_ACK MAX_RETRIES
 
   exec python3 "${SCRIPT_DIR}/server/uart_server_v5.py" \
       "${PORT}" -b "${BAUD}" "${FLOW_FLAGS[@]}" \
@@ -103,18 +151,30 @@ run_server() {
 }
 
 run_client() {
-  SAY "Iniciando cliente en ${PORT} @ ${BAUD} (flow: ${FLOW_FLAGS[*]:-none})"
+  SAY "🚀 Iniciando CLIENTE UART con protocolo ACK"
+  SAY "Puerto: ${PORT} @ ${BAUD} bauds"  
+  SAY "Flow control: ${FLOW_FLAGS[*]:-ninguno}"
+  SAY "Protocolo ACK: $([ "${ENABLE_ACK}" == "1" ] && echo "✅ HABILITADO" || echo "⚠️ deshabilitado")"
+  SAY "Timeout respuesta: ${RESP_TIMEOUT}s"
+  
   local res_flag=(-r "${RESOLUTION:-THUMBNAIL}")
   local out_flag=()
   [[ -n "${OUTPUT_PATH:-}" ]] && out_flag+=(--output "${OUTPUT_PATH}")
+  
+  local ack_flag=()
+  [[ "${ENABLE_ACK}" == "0" ]] && ack_flag+=(--no-ack)
 
-  # export para que el script pueda leer RESP_TIMEOUT si lo soporta
-  export RESP_TIMEOUT
+  # Exportar variables para el cliente
+  export ENABLE_ACK MAX_RETRIES RESP_TIMEOUT
 
   exec python3 "${SCRIPT_DIR}/client/uart_client_v5.py" \
       "${PORT}" -b "${BAUD}" "${FLOW_FLAGS[@]}" \
-      "${res_flag[@]}" "${out_flag[@]}"
+      "${res_flag[@]}" "${out_flag[@]}" "${ack_flag[@]}" \
+      --max-retries "${MAX_RETRIES}"
 }
+
+# ---------------- Main ----------------
+check_files
 
 case "${MODE}" in
   server) run_server ;;
