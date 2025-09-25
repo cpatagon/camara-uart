@@ -1,11 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Servidor con RTS/CTS
-# ./init.sh server --port /dev/serial0 --baud 57600 --rtscts --sleep-ms 0
 
-# Cliente con RTS/CTS
-# ./init.sh client --port /dev/ttyS0 --baud 57600 --rtscts --resp-timeout 45
+
 
 
 # ---------------- Config por defecto (overrides con flags o env) ----------------
