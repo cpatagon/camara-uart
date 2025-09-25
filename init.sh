@@ -88,7 +88,6 @@ while [[ $# -gt 0 ]]; do
     --resolution)  RESOLUTION="${2:?}"; shift 2 ;;
     --output)      OUTPUT_PATH="${2:?}"; shift 2 ;;
     --no-ack)      ENABLE_ACK=0; shift ;;
-    --max-retries) MAX_RETRIES="${2:?}"; shift 2 ;;
     -h|--help)     usage; exit 0 ;;
     *) ERR "Flag desconocida: $1"; usage; exit 1 ;;
   esac
@@ -169,8 +168,7 @@ run_client() {
 
   exec python3 "${SCRIPT_DIR}/client/uart_client_v5.py" \
       "${PORT}" -b "${BAUD}" "${FLOW_FLAGS[@]}" \
-      "${res_flag[@]}" "${out_flag[@]}" "${ack_flag[@]}" \
-      --max-retries "${MAX_RETRIES}"
+      "${res_flag[@]}" "${out_flag[@]}" "${ack_flag[@]}" 
 }
 
 # ---------------- Main ----------------
