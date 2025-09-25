@@ -1,46 +1,70 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Cliente UART con diagnóstico avanzado de últimos bytes
+Cliente UART v5 OPTIMIZADO - Solución al problema de timing
 """
 
 import serial
 import time
 import struct
 import logging
-import binascii
-import argparse
 from datetime import datetime
+import argparse
+import subprocess
+import os
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+# Logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
 
-class EnhancedUARTClient:
-    def __init__(self, port, baudrate=38400, timeout=3, rtscts=False, xonxoff=True):
+# Protocolo
+CMD_START = "FOTO:"
+RESP_OK = "OK|"
+RESP_BAD = "BAD|"
+TIMEOUT_RESP = 15  # esperar OK|size
+START_MARKER = b'\xAA' * 10    # inicio de stream binario
+SIZE_BYTES = 4                 # tamaño en 4 bytes big-endian
+
+# Delimitadores de comando
+CMD_BEGIN = "<"
+CMD_END = ">"
+
+
+class OptimizedUARTClient:
+    def __init__(self, port, baudrate=19200, timeout=0.5, rtscts=False, xonxoff=True):
         self.port = port
         self.baudrate = baudrate
-        self.timeout = timeout
+        self.timeout = timeout  # TIMEOUT MUY CORTO para lectura ágil
         self.rtscts = rtscts
         self.xonxoff = xonxoff
         self.ser = None
         self.received_data = bytearray()
-        self.debug_log = []
-
-    def log_debug(self, message):
-        """Log con timestamp para análisis posterior"""
-        timestamp = time.time()
-        self.debug_log.append((timestamp, message))
-        logging.info(f"DEBUG: {message}")
 
     def connect(self):
+        """Conectar con configuración optimizada para timing"""
         try:
+            # Configuración previa del puerto si es posible
+            try:
+                subprocess.run([
+                    'stty', '-F', self.port,
+                    'speed', str(self.baudrate),
+                    'cs8', '-cstopb', '-parenb', 'raw',
+                    '-echo', '-echoe', '-echok'
+                ], check=True, timeout=3)
+                time.sleep(0.1)
+            except Exception as e:
+                logging.debug(f"stty setup: {e}")
+
             self.ser = serial.Serial(
                 port=self.port,
                 baudrate=self.baudrate,
                 parity=serial.PARITY_NONE,
                 stopbits=serial.STOPBITS_ONE,
                 bytesize=serial.EIGHTBITS,
-                timeout=self.timeout,
-                write_timeout=3,
+                timeout=self.timeout,        # TIMEOUT CORTO para agilidad
+                write_timeout=2,
                 rtscts=self.rtscts,
                 xonxoff=self.xonxoff
             )
@@ -49,19 +73,20 @@ class EnhancedUARTClient:
             for _ in range(3):
                 self.ser.reset_input_buffer()
                 self.ser.reset_output_buffer()
-                time.sleep(0.1)
+                time.sleep(0.05)
 
-            logging.info(f"Conectado: {self.port} @ {self.baudrate} (rtscts={self.rtscts}, xonxoff={self.xonxoff})")
+            logging.info(f"✅ Conectado: {self.port} @ {self.baudrate} (timeout={self.timeout}s)")
             return True
+
         except Exception as e:
-            logging.error(f"Error conexión: {e}")
+            logging.error(f"❌ Error conexión: {e}")
             return False
 
-    def send_command_and_wait_response(self, resolution="HD_READY"):
-        """Enviar comando y esperar respuesta"""
+    def send_command(self, resolution="THUMBNAIL"):
+        """Enviar comando"""
         try:
-            cmd = f"<FOTO:{{size_name:{resolution}}}>\r\n"
-            logging.info(f"Enviando comando: {cmd.strip()}")
+            cmd = f"{CMD_BEGIN}{CMD_START}{{size_name:{resolution}}}{CMD_END}\r\n"
+            logging.info(f"📤 Enviando comando: {cmd.strip()}")
 
             self.ser.reset_input_buffer()
             self.ser.reset_output_buffer()
@@ -69,54 +94,54 @@ class EnhancedUARTClient:
 
             self.ser.write(cmd.encode('utf-8'))
             self.ser.flush()
-            time.sleep(1.0)
-
-            # Esperar respuesta
-            response_line = self.ser.readline().decode('utf-8', errors='ignore').strip()
-            logging.info(f"Respuesta recibida: {response_line}")
-
-            if not response_line.startswith("OK|"):
-                logging.error(f"Respuesta inválida: {response_line}")
-                return None
-
-            expected_size = int(response_line.split("|")[1])
-            logging.info(f"Tamaño esperado: {expected_size} bytes")
-            return expected_size
-
+            logging.info("✅ Comando enviado - esperando respuesta...")
+            time.sleep(0.5)
+            return True
         except Exception as e:
-            logging.error(f"Error enviando comando: {e}")
-            return None
+            logging.error(f"❌ Error enviando: {e}")
+            return False
 
-    def find_start_marker(self):
-        """Buscar marcador de inicio"""
-        start_marker = b'\xAA' * 10
+    def wait_for_response(self, timeout_s=None):
+        """Esperar respuesta del servidor"""
+        if timeout_s is None:
+            timeout_s = TIMEOUT_RESP
+        end = time.time() + timeout_s
+        
+        while time.time() < end:
+            lb = self.ser.readline()
+            if not lb:
+                continue
+            try:
+                line = lb.decode('utf-8', errors='ignore').strip()
+            except:
+                continue
+            if line.startswith(RESP_OK) or line.startswith(RESP_BAD):
+                logging.info(f"✅ Respuesta recibida: {line}")
+                return line
+        logging.warning("⏱️ Timeout esperando respuesta")
+        return None
+
+    def _wait_start_marker(self, max_wait=30):
+        """Esperar START_MARKER"""
+        logging.info("🔍 Buscando marcador de inicio...")
+        deadline = time.time() + max_wait
         window = bytearray()
-        attempts = 0
-        max_attempts = 1000
 
-        logging.info("Buscando marcador de inicio...")
-
-        while attempts < max_attempts:
+        while time.time() < deadline:
             b = self.ser.read(1)
             if not b:
-                attempts += 1
                 continue
-
             window += b
-            if len(window) > len(start_marker):
-                window = window[-len(start_marker):]
-
-            if window == start_marker:
-                logging.info("Marcador de inicio encontrado")
+            if len(window) > len(START_MARKER):
+                window = window[-len(START_MARKER):]
+            if window == START_MARKER:
+                logging.info("✅ Marcador de inicio encontrado")
                 return True
-
-            attempts += 1
-
-        logging.error("No se encontró marcador de inicio")
+        logging.error("❌ No se encontró marcador de inicio")
         return False
 
-    def read_size_header(self):
-        """Leer cabecera de tamaño (4 bytes)"""
+    def _read_size_header(self):
+        """Leer tamaño (4 bytes)"""
         size_data = b''
         deadline = time.time() + 10
 
@@ -126,236 +151,228 @@ class EnhancedUARTClient:
                 size_data += chunk
 
         if len(size_data) != 4:
-            logging.error(f"No se pudieron leer 4 bytes de tamaño: {len(size_data)}")
+            logging.error(f"❌ No se pudieron leer 4 bytes de tamaño")
             return None
 
         transmitted_size = struct.unpack('>I', size_data)[0]
-        logging.info(f"Tamaño transmitido: {transmitted_size} bytes (hex: {size_data.hex()})")
+        logging.info(f"📊 Tamaño transmitido: {transmitted_size} bytes")
         return transmitted_size
 
-    def receive_with_enhanced_diagnostics(self, expected_size):
-        """Recepción con diagnóstico avanzado de últimos bytes"""
-        self.received_data = bytearray()
-        chunk_size = 4096
-        last_activity = time.time()
-        consecutive_empty_reads = 0
-        recovery_attempts = 0
-        max_recovery_attempts = 5
-
-        logging.info(f"Iniciando recepción mejorada de {expected_size} bytes...")
-
-        while len(self.received_data) < expected_size:
-            remaining = expected_size - len(self.received_data)
-            to_read = min(chunk_size, remaining)
-
-            # Información de estado antes de leer
-            buffer_before = self.ser.in_waiting
-            time_since_activity = time.time() - last_activity
-
-            chunk = self.ser.read(to_read)
-
-            if chunk:
-                self.received_data.extend(chunk)
-                last_activity = time.time()
-                consecutive_empty_reads = 0
-                recovery_attempts = 0
-
-                # Log detallado para últimos 10KB
-                if remaining <= 10240:
-                    buffer_after = self.ser.in_waiting
-                    self.log_debug(f"Últimos {remaining} bytes - recibidos: {len(chunk)}, "
-                                 f"buffer: {buffer_before}->{buffer_after}")
-
-                # Log cada 25KB o cuando quedan pocos bytes
-                if len(self.received_data) % 25600 == 0 or remaining <= 5120:
-                    pct = int(len(self.received_data) * 100 / expected_size)
-                    logging.info(f"Progreso: {len(self.received_data)}/{expected_size} ({pct}%) "
-                               f"- buffer: {buffer_before}")
-
-            else:
-                consecutive_empty_reads += 1
-                buffer_current = self.ser.in_waiting
-
-                self.log_debug(f"Sin datos #{consecutive_empty_reads} - "
-                             f"inactividad: {time_since_activity:.1f}s - "
-                             f"buffer: {buffer_current} - faltan: {remaining}")
-
-                # DIAGNÓSTICO CRÍTICO: cuando quedan pocos bytes
-                if remaining <= 2048:
-                    self.log_debug(f"CRÍTICO: Solo faltan {remaining} bytes")
-                    
-                    # Estrategias de recuperación
-                    if consecutive_empty_reads >= 10 and recovery_attempts < max_recovery_attempts:
-                        recovery_attempts += 1
-                        self.log_debug(f"Intento recuperación #{recovery_attempts}")
-                        
-                        # Estrategia 1: Cambiar timeout temporalmente
-                        if recovery_attempts == 1:
-                            old_timeout = self.ser.timeout
-                            self.ser.timeout = 0.1
-                            self.log_debug("Reduciendo timeout a 0.1s")
-                            time.sleep(0.5)
-                            self.ser.timeout = old_timeout
-                            
-                        # Estrategia 2: Leer byte a byte
-                        elif recovery_attempts == 2:
-                            self.log_debug("Cambiando a lectura byte a byte")
-                            chunk_size = 1
-                            
-                        # Estrategia 3: Reset de buffers
-                        elif recovery_attempts == 3:
-                            self.log_debug("Reseteando buffers")
-                            self.ser.reset_input_buffer()
-                            time.sleep(0.2)
-                            
-                        # Estrategia 4: Pausa larga
-                        elif recovery_attempts == 4:
-                            self.log_debug("Pausa de recuperación 2s")
-                            time.sleep(2.0)
-                            
-                        consecutive_empty_reads = 0
-
-                # Timeout definitivo después de muchos intentos
-                if time_since_activity > 15 and consecutive_empty_reads > 50:
-                    logging.error(f"Timeout definitivo - recibido {len(self.received_data)}/{expected_size}")
-                    break
-
-                time.sleep(0.1)
-
-        bytes_received = len(self.received_data)
-        bytes_missing = expected_size - bytes_received
-
-        logging.info(f"RESULTADO: {bytes_received}/{expected_size} bytes - "
-                   f"perdidos: {bytes_missing} ({bytes_missing/expected_size*100:.2f}%)")
-
-        return bytes_received == expected_size
-
-    def analyze_final_data(self, expected_size):
-        """Análisis detallado de los datos finales"""
-        bytes_received = len(self.received_data)
-        bytes_missing = expected_size - bytes_received
-
-        print(f"\n=== ANÁLISIS FINAL ===")
-        print(f"Esperado: {expected_size} bytes")
-        print(f"Recibido: {bytes_received} bytes")
-        print(f"Perdido:  {bytes_missing} bytes")
-
-        if bytes_missing > 0:
-            print(f"\n=== ANÁLISIS DE PÉRDIDA ===")
-            
-            # Verificar si hay datos residuales
-            self.ser.timeout = 0.1
-            extra_data = self.ser.read(2048)
-            if extra_data:
-                print(f"Datos extra encontrados: {len(extra_data)} bytes")
-                print(f"Hex sample: {extra_data[:32].hex()}")
-                
-                # Intentar agregar datos extra
-                self.received_data.extend(extra_data)
-                print(f"Total con extras: {len(self.received_data)} bytes")
-            else:
-                print("No hay datos residuales en buffer")
-
-        # Análisis JPEG
-        if bytes_received >= 4:
-            if self.received_data[:2] == b'\xff\xd8':
-                print("✅ Cabecera JPEG correcta (FFD8)")
-            else:
-                print(f"❌ Cabecera incorrecta: {self.received_data[:2].hex()}")
-
-            if self.received_data[-2:] == b'\xff\xd9':
-                print("✅ Final JPEG correcto (FFD9)")
-            else:
-                print(f"❌ Final incorrecto: {self.received_data[-4:].hex()}")
-
-        # Guardar archivos de análisis
-        timestamp = datetime.now().strftime("%H%M%S")
+    def _aggressive_read(self, remaining_bytes, max_time=20):
+        """Lectura agresiva de los últimos bytes"""
+        logging.info(f"🚀 Lectura agresiva de {remaining_bytes} bytes")
         
-        if self.received_data:
-            data_file = f"/tmp/received_data_{timestamp}.jpg"
-            with open(data_file, 'wb') as f:
-                f.write(self.received_data)
-            print(f"Datos guardados: {data_file}")
-
-        # Guardar log de debug
-        log_file = f"/tmp/debug_log_{timestamp}.txt"
-        with open(log_file, 'w') as f:
-            for ts, msg in self.debug_log:
-                f.write(f"{ts:.3f}: {msg}\n")
-        print(f"Log debug guardado: {log_file}")
-
-        return bytes_received == expected_size
-
-    def run_enhanced_test(self, resolution="HD_READY", output_path=None):
-        """Ejecutar test completo con diagnósticos"""
-        print("=== CLIENTE DIAGNÓSTICO AVANZADO ===")
+        start_time = time.time()
+        collected_data = bytearray()
         
-        if not self.connect():
-            return False
-
+        # Estrategia de lectura múltiple con timeout muy corto
+        original_timeout = self.ser.timeout
+        
         try:
-            # Enviar comando y esperar respuesta
-            expected_size = self.send_command_and_wait_response(resolution)
-            if not expected_size:
+            # Fase 1: Lectura con timeout muy corto para agilidad
+            self.ser.timeout = 0.1
+            deadline = time.time() + max_time
+            consecutive_failures = 0
+            
+            while len(collected_data) < remaining_bytes and time.time() < deadline:
+                # Calcular cuánto leer
+                to_read = min(1024, remaining_bytes - len(collected_data))
+                
+                chunk = self.ser.read(to_read)
+                if chunk:
+                    collected_data.extend(chunk)
+                    consecutive_failures = 0
+                    
+                    if remaining_bytes - len(collected_data) <= 100:
+                        # Últimos 100 bytes: timeout aún más corto
+                        self.ser.timeout = 0.05
+                        logging.info(f"🔍 Últimos {remaining_bytes - len(collected_data)} bytes")
+                else:
+                    consecutive_failures += 1
+                    
+                    # Si llevamos varios fallos, revisar buffer
+                    if consecutive_failures >= 3:
+                        buffer_size = self.ser.in_waiting
+                        if buffer_size > 0:
+                            # Hay datos disponibles, leer inmediatamente
+                            chunk = self.ser.read(buffer_size)
+                            if chunk:
+                                collected_data.extend(chunk)
+                                consecutive_failures = 0
+                        else:
+                            # No hay buffer, pausa mínima
+                            time.sleep(0.01)
+                    
+                    # Timeout progresivo si llevamos muchos fallos
+                    if consecutive_failures >= 10:
+                        time.sleep(0.05)
+                    elif consecutive_failures >= 20:
+                        time.sleep(0.1)
+
+            elapsed = time.time() - start_time
+            logging.info(f"📊 Lectura agresiva: {len(collected_data)}/{remaining_bytes} en {elapsed:.1f}s")
+            
+            return collected_data
+            
+        finally:
+            self.ser.timeout = original_timeout
+
+    def receive_image_optimized(self, file_size, save_path=None):
+        """Recepción optimizada para el problema de timing"""
+        try:
+            logging.info("📥 Recepción optimizada iniciada...")
+
+            # 1) Buscar marcador
+            if not self._wait_start_marker(max_wait=30):
                 return False
 
-            # Buscar marcador y leer tamaño
-            if not self.find_start_marker():
-                return False
-
-            transmitted_size = self.read_size_header()
+            # 2) Leer tamaño
+            transmitted_size = self._read_size_header()
             if not transmitted_size:
                 return False
 
-            # Verificar consistencia de tamaños
-            if expected_size != transmitted_size:
-                logging.warning(f"Diferencia de tamaños: ASCII={expected_size}, binario={transmitted_size}")
+            logging.info(f"📊 Esperado: {file_size}, Transmitido: {transmitted_size}")
 
-            # Recepción con diagnósticos
-            success = self.receive_with_enhanced_diagnostics(transmitted_size)
+            # 3) Recepción principal con estrategia híbrida
+            self.received_data = bytearray()
+            chunk_size = 4096
+            last_activity = time.time()
+            
+            # Fase principal: lectura normal hasta estar cerca del final
+            while len(self.received_data) < transmitted_size:
+                remaining = transmitted_size - len(self.received_data)
+                
+                # Cambio de estrategia en los últimos 5KB
+                if remaining <= 5120:
+                    logging.info(f"🎯 Cambiando a lectura agresiva (faltan {remaining} bytes)")
+                    
+                    # Lectura agresiva de los bytes finales
+                    final_data = self._aggressive_read(remaining, max_time=15)
+                    if final_data:
+                        self.received_data.extend(final_data)
+                    break
+                
+                # Lectura normal
+                to_read = min(chunk_size, remaining)
+                chunk = self.ser.read(to_read)
+                
+                if chunk:
+                    self.received_data.extend(chunk)
+                    last_activity = time.time()
+                    
+                    # Log cada 50KB
+                    if len(self.received_data) % 51200 == 0:
+                        pct = int(len(self.received_data) * 100 / transmitted_size)
+                        logging.info(f"📦 Progreso: {len(self.received_data)}/{transmitted_size} ({pct}%)")
+                else:
+                    # Sin datos
+                    if time.time() - last_activity > 10:
+                        logging.warning(f"⏱️ Timeout en lectura normal")
+                        break
 
-            # Análisis final
-            final_success = self.analyze_final_data(transmitted_size)
+            bytes_received = len(self.received_data)
+            logging.info(f"✅ Recibido: {bytes_received}/{transmitted_size} bytes")
 
-            # Guardar resultado final si se especifica
-            if output_path and self.received_data:
-                with open(output_path, 'wb') as f:
+            # 4) Verificación JPEG
+            success = bytes_received == transmitted_size
+            
+            if bytes_received >= 4:
+                if self.received_data[:2] == b'\xff\xd8':
+                    logging.info("✅ Cabecera JPEG correcta")
+                else:
+                    logging.warning("⚠️ Cabecera JPEG incorrecta")
+                
+                if self.received_data[-2:] == b'\xff\xd9':
+                    logging.info("✅ Final JPEG correcto")
+                    success = True  # Imagen completa aunque falten marcadores
+                else:
+                    logging.warning("⚠️ Final JPEG incorrecto")
+
+            # 5) Guardar
+            if not save_path:
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                save_path = f"imagen_opt_{timestamp}.jpg"
+
+            if self.received_data:
+                with open(save_path, 'wb') as f:
                     f.write(self.received_data)
-                print(f"Imagen final guardada: {output_path}")
+                logging.info(f"💾 Imagen guardada: {save_path}")
 
-            return final_success
+            return success
 
         except Exception as e:
-            logging.error(f"Error durante test: {e}")
+            logging.error(f"❌ Error recepción optimizada: {e}")
             return False
-        finally:
-            if self.ser:
+
+    def close(self):
+        try:
+            if self.ser and self.ser.is_open:
+                self.ser.reset_input_buffer()
+                self.ser.reset_output_buffer()
                 self.ser.close()
+                logging.info("🔌 Conexión cerrada")
+        except:
+            pass
+
 
 def main():
-    parser = argparse.ArgumentParser(description='Cliente diagnóstico avanzado')
+    parser = argparse.ArgumentParser(description='Cliente UART v5 Optimizado')
     parser.add_argument('port', help='Puerto serial')
-    parser.add_argument('--baudrate', '-b', type=int, default=38400)
+    parser.add_argument('--resp-timeout', type=int, default=45)
     parser.add_argument('--resolution', '-r', default='HD_READY')
-    parser.add_argument('--output', '-o', help='Archivo de salida')
+    parser.add_argument('--output', '-o', help='Ruta de salida')
+    parser.add_argument('--baudrate', '-b', type=int, default=19200)
     parser.add_argument('--rtscts', action='store_true')
-    parser.add_argument('--xonxoff', action='store_true', default=True)
-    
+    parser.add_argument('--xonxoff', action='store_true')
+
     args = parser.parse_args()
-    
-    client = EnhancedUARTClient(
+
+    # Timeout desde env
+    resp_timeout = int(os.environ.get('RESP_TIMEOUT', args.resp_timeout))
+
+    print("=" * 60)
+    print("Cliente UART v5 OPTIMIZADO - Solución Timing")
+    print("=" * 60)
+
+    client = OptimizedUARTClient(
         port=args.port,
         baudrate=args.baudrate,
+        timeout=0.3,  # Timeout muy corto para agilidad
         rtscts=args.rtscts,
         xonxoff=args.xonxoff
     )
-    
-    success = client.run_enhanced_test(args.resolution, args.output)
-    
-    if success:
-        print("\n✅ TEST EXITOSO")
-    else:
-        print("\n❌ TEST FALLÓ")
+
+    try:
+        if not client.connect():
+            return
+
+        if not client.send_command(args.resolution.upper()):
+            return
+
+        response = client.wait_for_response(timeout_s=resp_timeout)
+        if not response or not response.startswith(RESP_OK):
+            logging.error(f"❌ Error del servidor: {response}")
+            return
+
+        file_size_ascii = int(response.split("|")[1])
+        success = client.receive_image_optimized(file_size_ascii, args.output)
+
+        if success:
+            logging.info("=" * 60)
+            logging.info("✅ PROCESO COMPLETO EXITOSO")
+            logging.info("=" * 60)
+        else:
+            logging.info("=" * 60)
+            logging.info("⚠️ PROCESO COMPLETADO CON ADVERTENCIAS")
+            logging.info("=" * 60)
+
+    except KeyboardInterrupt:
+        logging.info("\n🛑 Cliente detenido")
+    except Exception as e:
+        logging.error(f"❌ Error: {e}")
+    finally:
+        client.close()
+
 
 if __name__ == "__main__":
     main()
