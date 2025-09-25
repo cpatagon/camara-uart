@@ -11,6 +11,7 @@ import logging
 from datetime import datetime
 import argparse
 import subprocess
+import os
 
 # Logging
 logging.basicConfig(
@@ -100,10 +101,11 @@ class UARTPhotoClient:
             logging.error(f"❌ Error enviando: {e}")
             return False
 
-    def wait_for_response(self):
+    def wait_for_response(self, timeout_s=None):
+        """Esperar respuesta del servidor."""
         if timeout_s is None:
             timeout_s = TIMEOUT_RESP
-    end = time.time() + timeout_s
+        end = time.time() + timeout_s
         line_bytes = bytearray()
         while time.time() < end:
             lb = self.ser.readline()  # lee solo hasta \n
@@ -257,6 +259,9 @@ def main():
 
     args = parser.parse_args()
 
+    # Leer timeout desde env si está disponible
+    resp_timeout = int(os.environ.get('RESP_TIMEOUT', args.resp_timeout))
+
     print("=" * 60)
     print("Cliente UART v4.1 - Recepción por tamaño exacto")
     print("=" * 60)
@@ -280,7 +285,7 @@ def main():
             logging.error("❌ Error enviando comando")
             return
 
-        response = client.wait_for_response()
+        response = client.wait_for_response(timeout_s=resp_timeout)
         if not response:
             logging.error("❌ No se recibió respuesta")
             return
