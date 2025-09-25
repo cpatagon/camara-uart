@@ -195,17 +195,21 @@ class UARTPhotoClientRobust:
         last_data_time = time.time()
         got = 0
         last_progress = 0
-        retry_detected = False
 
         while remaining > 0:
-            # Detectar posible retransmisión
-            if not retry_detected and self.ser.in_waiting >= 4:
-                peek_data = self.ser.peek(4)
-                if peek_data == b"\xCC" * 4:
+            # Detectar posible retransmisión mirando bytes disponibles
+            if self.ser.in_waiting >= 4:
+                # Leer 4 bytes para verificar si es marcador de retransmisión
+                potential_marker = self.ser.read(4)
+                if potential_marker == b"\xCC" * 4:
                     logging.info("🔄 Retransmisión detectada durante lectura")
-                    self.ser.read(4)  # Consumir marcador
-                    retry_detected = True
                     continue
+                else:
+                    # No era marcador, agregar estos bytes a los datos
+                    self.received_data.extend(potential_marker)
+                    got += len(potential_marker)
+                    remaining -= len(potential_marker)
+                    last_data_time = time.time()
 
             to_read = min(chunk_size, remaining)
             chunk = self.ser.read(to_read)

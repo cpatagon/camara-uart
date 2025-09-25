@@ -115,12 +115,22 @@ class UartTransportRobust:
                     return True, 0
                 elif line.startswith(ACK_MISSING):
                     try:
-                        received = int(line.split(":")[1])
-                        missing = expected_size - received
-                        logging.warning(f"⚠️ Faltan {missing} bytes (cliente recibió {received})")
-                        return False, missing
-                    except:
-                        logging.error("❌ Formato ACK_MISSING inválido")
+                        # Mejorar parsing de ACK_MISSING - manejar formato ACK_MISSING:123 o ACK_MISSING::0
+                        parts = line.split(":")
+                        if len(parts) >= 2:
+                            # Obtener el último elemento que no sea vacío
+                            received_str = [p for p in parts[1:] if p.strip()]
+                            if received_str:
+                                received = int(received_str[-1])
+                                missing = expected_size - received
+                                logging.warning(f"⚠️ Faltan {missing} bytes (cliente recibió {received})")
+                                return False, missing
+                        
+                        # Si no se puede parsear, asumir que faltan todos los bytes
+                        logging.warning(f"⚠️ Formato ACK_MISSING no estándar, asumiendo 0 bytes recibidos")
+                        return False, expected_size
+                    except Exception as e:
+                        logging.error(f"❌ Error parseando ACK_MISSING '{line}': {e}")
                         return False, expected_size
                 elif line == ACK_ERROR:
                     logging.error("❌ Cliente reportó error")
