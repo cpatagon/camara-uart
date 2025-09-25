@@ -108,11 +108,11 @@ check_robust_files() {
     if [[ ! -f "${SCRIPT_DIR}/server/APIs/transport_api_robust.py" ]]; then
       missing_files+=("server/APIs/transport_api_robust.py")
     fi
-    if [[ ! -f "${SCRIPT_DIR}/uart_server_robust.py" ]]; then
+    if [[ ! -f "${SCRIPT_DIR}/server/uart_server_robust.py" ]]; then
       missing_files+=("uart_server_robust.py")
     fi
   elif [[ "${MODE}" == "client" ]]; then
-    if [[ ! -f "${SCRIPT_DIR}/uart_client_robust.py" ]]; then
+    if [[ ! -f "${SCRIPT_DIR}/client/uart_client_robust.py" ]]; then
       missing_files+=("uart_client_robust.py")
     fi
   fi
