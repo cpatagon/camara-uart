@@ -71,20 +71,23 @@ class UartTransport:
 
     def _calculate_adaptive_sleep(self, remaining_bytes: int, base_sleep_ms: int) -> float:
         """Calcular pausa adaptativa basada en bytes restantes"""
-        base_sleep = max(0.003, base_sleep_ms / 1000.0)
+        base_sleep = max(0.005, base_sleep_ms / 1000.0)
         
-        if remaining_bytes <= 512:
+        if remaining_bytes <= 256:
+            # Últimos 256 bytes: EXTREMADAMENTE lento
+            return base_sleep * 25  # 25x más lento
+        elif remaining_bytes <= 512:
             # Últimos 512 bytes: MUY lento
-            return base_sleep * 10  # 10x más lento
+            return base_sleep * 20  # 20x más lento
         elif remaining_bytes <= 1024:
             # Últimos 1KB: Muy lento
-            return base_sleep * 6   # 6x más lento
+            return base_sleep * 15  # 15x más lento
         elif remaining_bytes <= 2048:
             # Últimos 2KB: Lento
-            return base_sleep * 4   # 4x más lento
+            return base_sleep * 10  # 10x más lento
         elif remaining_bytes <= 5120:
             # Últimos 5KB: Más lento
-            return base_sleep * 2   # 2x más lento
+            return base_sleep * 5   # 5x más lento
         else:
             # Transmisión normal
             return base_sleep

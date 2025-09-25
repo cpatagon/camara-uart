@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Cliente UART v5 OPTIMIZADO - Solución al problema de timing
+Cliente UART v4.1 - Recepción por tamaño exacto (robusto)
 """
 
 import serial
@@ -32,30 +32,30 @@ CMD_BEGIN = "<"
 CMD_END = ">"
 
 
-class OptimizedUARTClient:
-    def __init__(self, port, baudrate=19200, timeout=0.5, rtscts=False, xonxoff=True):
+class UARTPhotoClient:
+    def __init__(self, port, baudrate=57600, timeout=8, rtscts=False, xonxoff=False):
         self.port = port
         self.baudrate = baudrate
-        self.timeout = timeout  # TIMEOUT MUY CORTO para lectura ágil
+        self.timeout = timeout
         self.rtscts = rtscts
         self.xonxoff = xonxoff
         self.ser = None
         self.received_data = bytearray()
 
     def connect(self):
-        """Conectar con configuración optimizada para timing"""
+        """Conectar al puerto serial con configuración robusta."""
         try:
-            # Configuración previa del puerto si es posible
+            # Intento de preparar puerto (no crítico si falla)
             try:
                 subprocess.run([
                     'stty', '-F', self.port,
                     'speed', str(self.baudrate),
-                    'cs8', '-cstopb', '-parenb', 'raw',
+                    'cs8', '-cstopb', '-parenb', 'raw', '-crtscts',
                     '-echo', '-echoe', '-echok'
                 ], check=True, timeout=3)
-                time.sleep(0.1)
+                time.sleep(0.2)
             except Exception as e:
-                logging.debug(f"stty setup: {e}")
+                logging.debug(f"(stty opcional) {e}")
 
             self.ser = serial.Serial(
                 port=self.port,
@@ -63,7 +63,7 @@ class OptimizedUARTClient:
                 parity=serial.PARITY_NONE,
                 stopbits=serial.STOPBITS_ONE,
                 bytesize=serial.EIGHTBITS,
-                timeout=self.timeout,        # TIMEOUT CORTO para agilidad
+                timeout=self.timeout,        # lectura bloqueante con timeout
                 write_timeout=2,
                 rtscts=self.rtscts,
                 xonxoff=self.xonxoff
@@ -73,9 +73,9 @@ class OptimizedUARTClient:
             for _ in range(3):
                 self.ser.reset_input_buffer()
                 self.ser.reset_output_buffer()
-                time.sleep(0.05)
+                time.sleep(0.1)
 
-            logging.info(f"✅ Conectado: {self.port} @ {self.baudrate} (timeout={self.timeout}s)")
+            logging.info(f"✅ Conectado: {self.port} @ {self.baudrate} (rtscts={self.rtscts}, xonxoff={self.xonxoff})")
             return True
 
         except Exception as e:
@@ -83,7 +83,7 @@ class OptimizedUARTClient:
             return False
 
     def send_command(self, resolution="THUMBNAIL"):
-        """Enviar comando"""
+        """Enviar comando UNA SOLA VEZ."""
         try:
             cmd = f"{CMD_BEGIN}{CMD_START}{{size_name:{resolution}}}{CMD_END}\r\n"
             logging.info(f"📤 Enviando comando: {cmd.strip()}")
@@ -95,20 +95,20 @@ class OptimizedUARTClient:
             self.ser.write(cmd.encode('utf-8'))
             self.ser.flush()
             logging.info("✅ Comando enviado - esperando respuesta...")
-            time.sleep(0.5)
+            time.sleep(1.0)  # pequeño respiro para el servidor
             return True
         except Exception as e:
             logging.error(f"❌ Error enviando: {e}")
             return False
 
     def wait_for_response(self, timeout_s=None):
-        """Esperar respuesta del servidor"""
+        """Esperar respuesta del servidor."""
         if timeout_s is None:
             timeout_s = TIMEOUT_RESP
         end = time.time() + timeout_s
-        
+        line_bytes = bytearray()
         while time.time() < end:
-            lb = self.ser.readline()
+            lb = self.ser.readline()  # lee solo hasta \n
             if not lb:
                 continue
             try:
@@ -122,13 +122,13 @@ class OptimizedUARTClient:
         return None
 
     def _wait_start_marker(self, max_wait=30):
-        """Esperar START_MARKER"""
+        """Esperar START_MARKER con ventana deslizante."""
         logging.info("🔍 Buscando marcador de inicio...")
         deadline = time.time() + max_wait
         window = bytearray()
 
         while time.time() < deadline:
-            b = self.ser.read(1)
+            b = self.ser.read(1)  # respeta self.timeout
             if not b:
                 continue
             window += b
@@ -140,168 +140,99 @@ class OptimizedUARTClient:
         logging.error("❌ No se encontró marcador de inicio")
         return False
 
-    def _read_size_header(self):
-        """Leer tamaño (4 bytes)"""
-        size_data = b''
-        deadline = time.time() + 10
+    def _read_exact(self, nbytes, inactivity_timeout=30, chunk_size=4096, log_label=""):
+        """Leer exactamente nbytes, con timeout por inactividad."""
+        remaining = nbytes
+        last_data_time = time.time()
+        got = 0
+        last_progress = 0
 
-        while len(size_data) < 4 and time.time() < deadline:
-            chunk = self.ser.read(4 - len(size_data))
+        while remaining > 0:
+            to_read = chunk_size if remaining > chunk_size else remaining
+            chunk = self.ser.read(to_read)
             if chunk:
-                size_data += chunk
+                self.received_data.extend(chunk)
+                got += len(chunk)
+                remaining -= len(chunk)
+                last_data_time = time.time()
 
-        if len(size_data) != 4:
-            logging.error(f"❌ No se pudieron leer 4 bytes de tamaño")
-            return None
+                if nbytes >= 10000:  # log cada ~10%
+                    progress = int((got / nbytes) * 100)
+                    if progress - last_progress >= 10:
+                        logging.info(f"📊 Progreso{(' ' + log_label) if log_label else ''}: {got}/{nbytes} bytes ({progress}%)")
+                        last_progress = progress
+            else:
+                if time.time() - last_data_time > inactivity_timeout:
+                    logging.error(f"❌ Timeout sin datos (recibido {got}/{nbytes})")
+                    return False
+        return True
 
-        transmitted_size = struct.unpack('>I', size_data)[0]
-        logging.info(f"📊 Tamaño transmitido: {transmitted_size} bytes")
-        return transmitted_size
-
-    def _aggressive_read(self, remaining_bytes, max_time=20):
-        """Lectura agresiva de los últimos bytes"""
-        logging.info(f"🚀 Lectura agresiva de {remaining_bytes} bytes")
-        
-        start_time = time.time()
-        collected_data = bytearray()
-        
-        # Estrategia de lectura múltiple con timeout muy corto
-        original_timeout = self.ser.timeout
-        
+    def receive_image_simple(self, file_size, save_path=None):
+        """Recepción CONFIABLE por tamaño exacto (ignora marcadores en el stream)."""
         try:
-            # Fase 1: Lectura con timeout muy corto para agilidad
-            self.ser.timeout = 0.1
-            deadline = time.time() + max_time
-            consecutive_failures = 0
-            
-            while len(collected_data) < remaining_bytes and time.time() < deadline:
-                # Calcular cuánto leer
-                to_read = min(1024, remaining_bytes - len(collected_data))
-                
-                chunk = self.ser.read(to_read)
-                if chunk:
-                    collected_data.extend(chunk)
-                    consecutive_failures = 0
-                    
-                    if remaining_bytes - len(collected_data) <= 100:
-                        # Últimos 100 bytes: timeout aún más corto
-                        self.ser.timeout = 0.05
-                        logging.info(f"🔍 Últimos {remaining_bytes - len(collected_data)} bytes")
-                else:
-                    consecutive_failures += 1
-                    
-                    # Si llevamos varios fallos, revisar buffer
-                    if consecutive_failures >= 3:
-                        buffer_size = self.ser.in_waiting
-                        if buffer_size > 0:
-                            # Hay datos disponibles, leer inmediatamente
-                            chunk = self.ser.read(buffer_size)
-                            if chunk:
-                                collected_data.extend(chunk)
-                                consecutive_failures = 0
-                        else:
-                            # No hay buffer, pausa mínima
-                            time.sleep(0.01)
-                    
-                    # Timeout progresivo si llevamos muchos fallos
-                    if consecutive_failures >= 10:
-                        time.sleep(0.05)
-                    elif consecutive_failures >= 20:
-                        time.sleep(0.1)
+            logging.info("📥 Recepción simple iniciada...")
 
-            elapsed = time.time() - start_time
-            logging.info(f"📊 Lectura agresiva: {len(collected_data)}/{remaining_bytes} en {elapsed:.1f}s")
-            
-            return collected_data
-            
-        finally:
-            self.ser.timeout = original_timeout
-
-    def receive_image_optimized(self, file_size, save_path=None):
-        """Recepción optimizada para el problema de timing"""
-        try:
-            logging.info("📥 Recepción optimizada iniciada...")
-
-            # 1) Buscar marcador
+            # 1) Esperar inicio
             if not self._wait_start_marker(max_wait=30):
                 return False
 
-            # 2) Leer tamaño
-            transmitted_size = self._read_size_header()
-            if not transmitted_size:
+            # 2) Leer 4 bytes de tamaño (big-endian)
+            size_data = b''
+            size_deadline = time.time() + 10
+            while len(size_data) < SIZE_BYTES and time.time() < size_deadline:
+                chunk = self.ser.read(SIZE_BYTES - len(size_data))
+                if chunk:
+                    size_data += chunk
+            if len(size_data) != SIZE_BYTES:
+                logging.error("❌ No se pudieron leer 4 bytes de tamaño")
                 return False
 
-            logging.info(f"📊 Esperado: {file_size}, Transmitido: {transmitted_size}")
+            transmitted_size = struct.unpack('>I', size_data)[0]
+            logging.info(f"📊 Bytes de tamaño: {size_data.hex()}")
+            logging.info(f"📊 Tamaño transmitido: {transmitted_size} bytes")
+            logging.info(f"📊 Tamaño esperado: {file_size} bytes")
 
-            # 3) Recepción principal con estrategia híbrida
+            # Diferencia tolerable (aviso)
+            if abs(transmitted_size - file_size) > max(1024, int(file_size * 0.1)):
+                logging.warning("⚠️ Diferencia inusual entre tamaño ASCII y binario")
+
+            # 3) Leer exactamente transmitted_size bytes
             self.received_data = bytearray()
-            chunk_size = 4096
-            last_activity = time.time()
-            
-            # Fase principal: lectura normal hasta estar cerca del final
-            while len(self.received_data) < transmitted_size:
-                remaining = transmitted_size - len(self.received_data)
-                
-                # Cambio de estrategia en los últimos 5KB
-                if remaining <= 5120:
-                    logging.info(f"🎯 Cambiando a lectura agresiva (faltan {remaining} bytes)")
-                    
-                    # Lectura agresiva de los bytes finales
-                    final_data = self._aggressive_read(remaining, max_time=15)
-                    if final_data:
-                        self.received_data.extend(final_data)
-                    break
-                
-                # Lectura normal
-                to_read = min(chunk_size, remaining)
-                chunk = self.ser.read(to_read)
-                
-                if chunk:
-                    self.received_data.extend(chunk)
-                    last_activity = time.time()
-                    
-                    # Log cada 50KB
-                    if len(self.received_data) % 51200 == 0:
-                        pct = int(len(self.received_data) * 100 / transmitted_size)
-                        logging.info(f"📦 Progreso: {len(self.received_data)}/{transmitted_size} ({pct}%)")
-                else:
-                    # Sin datos
-                    if time.time() - last_activity > 10:
-                        logging.warning(f"⏱️ Timeout en lectura normal")
-                        break
+            ok = self._read_exact(transmitted_size, inactivity_timeout=30, chunk_size=4096, log_label="")
+            if not ok:
+                return False
 
-            bytes_received = len(self.received_data)
-            logging.info(f"✅ Recibido: {bytes_received}/{transmitted_size} bytes")
+            logging.info(f"✅ Tamaño completo recibido: {len(self.received_data)} bytes")
 
-            # 4) Verificación JPEG
-            success = bytes_received == transmitted_size
-            
-            if bytes_received >= 4:
-                if self.received_data[:2] == b'\xff\xd8':
-                    logging.info("✅ Cabecera JPEG correcta")
-                else:
-                    logging.warning("⚠️ Cabecera JPEG incorrecta")
-                
-                if self.received_data[-2:] == b'\xff\xd9':
-                    logging.info("✅ Final JPEG correcto")
-                    success = True  # Imagen completa aunque falten marcadores
-                else:
-                    logging.warning("⚠️ Final JPEG incorrecto")
+            # 4) Drenar posible cola (p. ej. \xBB*10 o <FIN>) sin usarla para decidir
+            try:
+                original_timeout = self.ser.timeout
+                self.ser.timeout = 0.05
+                extra = self.ser.read(self.ser.in_waiting or 0)
+                if extra:
+                    logging.debug(f"🔚 Cola drenada ({len(extra)} bytes)")
+            finally:
+                self.ser.timeout = original_timeout
 
-            # 5) Guardar
+            # 5) Chequeos JPEG (solo advertencias)
+            if not (len(self.received_data) >= 2 and self.received_data[0] == 0xFF and self.received_data[1] == 0xD8):
+                logging.warning("⚠️ No se detecta cabecera JPEG (FFD8)")
+            if not (len(self.received_data) >= 2 and self.received_data[-2] == 0xFF and self.received_data[-1] == 0xD9):
+                logging.warning("⚠️ No se detecta fin JPEG (FFD9)")
+
+            # 6) Guardar
             if not save_path:
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                save_path = f"imagen_opt_{timestamp}.jpg"
+                save_path = f"imagen_{timestamp}.jpg"
 
-            if self.received_data:
-                with open(save_path, 'wb') as f:
-                    f.write(self.received_data)
-                logging.info(f"💾 Imagen guardada: {save_path}")
+            with open(save_path, 'wb') as f:
+                f.write(self.received_data)
 
-            return success
+            logging.info(f"💾 Imagen guardada: {save_path}")
+            return True
 
         except Exception as e:
-            logging.error(f"❌ Error recepción optimizada: {e}")
+            logging.error(f"❌ Error recepción: {e}")
             return False
 
     def close(self):
@@ -310,64 +241,79 @@ class OptimizedUARTClient:
                 self.ser.reset_input_buffer()
                 self.ser.reset_output_buffer()
                 self.ser.close()
-                logging.info("🔌 Conexión cerrada")
+                logging.info("🔌 Conexion cerrada")
         except:
             pass
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Cliente UART v5 Optimizado')
-    parser.add_argument('port', help='Puerto serial')
-    parser.add_argument('--resp-timeout', type=int, default=45)
-    parser.add_argument('--resolution', '-r', default='HD_READY')
-    parser.add_argument('--output', '-o', help='Ruta de salida')
-    parser.add_argument('--baudrate', '-b', type=int, default=19200)
-    parser.add_argument('--rtscts', action='store_true')
-    parser.add_argument('--xonxoff', action='store_true')
+    parser = argparse.ArgumentParser(description='Cliente UART v4.1 - Recepción por tamaño exacto')
+    parser.add_argument('port', help='Puerto serial (ej: /dev/serial0)')
+    parser.add_argument('--resp-timeout', type=int, default=45, help='Tiempo máx. para OK|size (seg)')
+    parser.add_argument('--resolution', '-r', default='HD_READY',
+                        help='Resolución: ULTRA_WIDE, FULL_HD, HD_READY, LOW_LIGHT, THUMBNAIL')
+    parser.add_argument('--output', '-o', help='Ruta donde guardar la imagen')
+    parser.add_argument('--baudrate', '-b', type=int, default=57600, help='Baud rate')
+    parser.add_argument('--rtscts', action='store_true', help='Habilitar RTS/CTS (hardware flow control)')
+    parser.add_argument('--xonxoff', action='store_true', help='Habilitar XON/XOFF (software flow control)')
 
     args = parser.parse_args()
 
-    # Timeout desde env
+    # Leer timeout desde env si está disponible
     resp_timeout = int(os.environ.get('RESP_TIMEOUT', args.resp_timeout))
 
     print("=" * 60)
-    print("Cliente UART v5 OPTIMIZADO - Solución Timing")
+    print("Cliente UART v4.1 - Recepción por tamaño exacto")
     print("=" * 60)
 
-    client = OptimizedUARTClient(
+    client = UARTPhotoClient(
         port=args.port,
         baudrate=args.baudrate,
-        timeout=0.3,  # Timeout muy corto para agilidad
+        timeout=8,
         rtscts=args.rtscts,
         xonxoff=args.xonxoff
     )
 
     try:
         if not client.connect():
+            logging.error("❌ Error conectando")
             return
 
+        time.sleep(0.5)
+
         if not client.send_command(args.resolution.upper()):
+            logging.error("❌ Error enviando comando")
             return
 
         response = client.wait_for_response(timeout_s=resp_timeout)
-        if not response or not response.startswith(RESP_OK):
+        if not response:
+            logging.error("❌ No se recibió respuesta")
+            return
+        if not response.startswith(RESP_OK):
             logging.error(f"❌ Error del servidor: {response}")
             return
 
-        file_size_ascii = int(response.split("|")[1])
-        success = client.receive_image_optimized(file_size_ascii, args.output)
+        # Extraer tamaño ASCII del OK|size (informativo)
+        try:
+            file_size_ascii = int(response.split("|")[1])
+            logging.info(f"📊 Tamaño esperado: {file_size_ascii} bytes")
+        except Exception:
+            logging.warning("⚠️ No se pudo parsear tamaño ASCII de la respuesta")
+            file_size_ascii = 0
+
+        success = client.receive_image_simple(file_size_ascii, args.output)
 
         if success:
             logging.info("=" * 60)
             logging.info("✅ PROCESO COMPLETO EXITOSO")
             logging.info("=" * 60)
         else:
-            logging.info("=" * 60)
-            logging.info("⚠️ PROCESO COMPLETADO CON ADVERTENCIAS")
-            logging.info("=" * 60)
+            logging.error("=" * 60)
+            logging.error("❌ ERROR EN EL PROCESO")
+            logging.error("=" * 60)
 
     except KeyboardInterrupt:
-        logging.info("\n🛑 Cliente detenido")
+        logging.info("\n🛑 Cliente detenido por usuario")
     except Exception as e:
         logging.error(f"❌ Error: {e}")
     finally:
