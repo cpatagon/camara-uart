@@ -142,7 +142,7 @@ run_server_robust() {
   # Exportar variables para el servidor
   export ENABLE_ACK MAX_RETRIES
 
-  exec python3 "${SCRIPT_DIR}/uart_server_robust.py" \
+  exec python3 "${SCRIPT_DIR}/server/uart_server_robust.py" \
       "${PORT}" -b "${BAUD}" "${FLOW_FLAGS[@]}" \
       "${no_cam_flag[@]}" "${fb_flag[@]}" \
       --sleep-ms "${SLEEP_MS}"
@@ -163,7 +163,7 @@ run_client_robust() {
   # Exportar variables para el cliente
   export RESP_TIMEOUT ENABLE_ACK
 
-  exec python3 "${SCRIPT_DIR}/uart_client_robust.py" \
+  exec python3 "${SCRIPT_DIR}/client/uart_client_robust.py" \
       "${PORT}" -b "${BAUD}" "${FLOW_FLAGS[@]}" \
       "${res_flag[@]}" "${out_flag[@]}" "${ack_flag[@]}" \
       --resp-timeout "${RESP_TIMEOUT}"
