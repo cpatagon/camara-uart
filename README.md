@@ -1,252 +1,460 @@
-# Sistema Cámara UART — v5
+# Sistema Cámara UART — v5 con Protocolo ACK
 
-**Cliente por tamaño exacto + APIs separadas de captura y transporte**
+**Sistema robusto de captura y transmisión de imágenes entre Raspberry Pi con verificación y retransmisión automática**
 
-> Proyecto para capturar una foto en una Raspberry Pi y transmitirla por UART a un cliente Python de manera **robusta** y **predecible**, leyendo **exactamente** el tamaño anunciado (sin cortar por marcadores que podrían aparecer en los datos comprimidos).
-
----
-
-## 🔎 Resumen
-
-* **Protocolo v4.1/v5**: el servidor responde `OK|<size>`, luego envía `0xAA*10` + **tamaño 4B big‑endian** + **JPEG (size bytes)**. Marcadores de fin (`0xBB*10`, `<FIN_TRANSMISION>`) son **opcionales** y se ignoran en el cliente.
-* **APIs separadas**:
-
-  * `photo_api.py` → *solo captura* (cámara o fallback).
-  * `transport_api.py` → *solo transporte* UART por **tamaño exacto**.
-* **Cliente**: espera `OK|size` y luego lee **exactamente** `size` bytes. Soporta **RTS/CTS** o **XON/XOFF** y timeout configurable.
+> Proyecto avanzado para capturar fotos en una Raspberry Pi y transmitirlas por UART con **protocolo ACK**, **verificación de integridad**, y **retransmisión automática** de datos perdidos o corruptos.
 
 ---
 
-## Componentes electrónicos
+## 🌟 Características Principales
 
-### servidor: 
- * HW: Raspberry Pi Zero W 
- * CAM: Raspberry Module 3 Wide  
- * SO: Raspbian GNU/Linux 12 (bookworm))
-### cliente: 
- * HW: Raspberry Pi 3 Model B 
- * SO: Raspbian GNU/Linux 12 (bookworm))
+- **✅ Protocolo ACK**: Verificación automática de recepción completa
+- **🔄 Retransmisión inteligente**: Corrección automática de datos perdidos
+- **📸 Múltiples resoluciones**: Desde thumbnail hasta ultra-wide
+- **🛡️ Transmisión robusta**: Control de flujo por hardware (RTS/CTS) o software (XON/XOFF)
+- **🎯 Lectura exacta**: Cliente lee exactamente el tamaño anunciado
+- **📊 Desaceleración adaptativa**: Ralentización progresiva en últimos KB para mayor estabilidad
+- **🔧 APIs separadas**: Arquitectura modular (captura + transporte)
+- **📈 Logging detallado**: Monitoreo completo del proceso
 
-### Comunicación 
+---
 
-# UART en Raspberry Pi — Pines GPIO
+## 🔎 Cómo Funciona el Protocolo
 
-## UART básico (sin RTS/CTS)
+### Flujo Completo con ACK:
+```
+1. Cliente → Servidor: <FOTO:{size_name:HD_READY}>
+2. Servidor → Cliente: OK|<size>
+3. Servidor → Cliente: 0xAA*10 + size(4B) + JPEG_DATA + marcadores
+4. Cliente → Servidor: ACK_OK | ACK_MISSING:<bytes_recibidos>
+5. [Si faltan datos] Servidor → Cliente: 0xCC*4 + datos_faltantes
+6. Cliente → Servidor: ACK_OK (confirmación final)
+```
 
-| Función UART |  GPIO (BCM) |     Pin físico | Conectar a…            |
-| ------------ | ----------: | -------------: | ---------------------- |
-| TXD0         | **GPIO 14** |          **8** | **RX** del otro equipo |
-| RXD0         | **GPIO 15** |         **10** | **TX** del otro equipo |
-| GND          |           — | **6 / 9 / 14** | **GND** común          |
+### Resoluciones Disponibles:
+- **THUMBNAIL**: 320×240 (ideal para pruebas rápidas)
+- **LOW_LIGHT**: 640×480 (buena relación velocidad/calidad)
+- **HD_READY**: 1280×720 (recomendado general)
+- **FULL_HD**: 1920×1080 (alta calidad)
+- **ULTRA_WIDE**: 4056×3040 (máxima resolución, más lento)
 
-## Con control de flujo por hardware (RTS/CTS habilitado)
+---
 
-| Señal    |  GPIO (BCM) | Pin físico | Conectar a…             |
-| -------- | ----------: | ---------: | ----------------------- |
-| **RTS0** | **GPIO 17** |     **11** | **CTS** servidor        |
-| **CTS0** | **GPIO 16** |     **36** | **RTS** cliente         |
+## 📋 Componentes del Sistema
 
-**Notas:**
+### Hardware Requerido:
+- **Servidor**: Raspberry Pi Zero W + Raspberry Camera Module 3 Wide
+- **Cliente**: Raspberry Pi 3 Model B (o superior)
+- **Comunicación**: Conexión UART con cables GPIO
 
-* Niveles lógicos: **3.3 V** (TTL).
-* Cruce de líneas: **TX→RX**, **RX→TX**, y en HW flow **RTS↔CTS**.
-* `/dev/ttyS0` y `/dev/serial0` usan estos mismos GPIO por defecto.
+### Software:
+- **Python 3.9+**
+- **pyserial**: `pip install pyserial`
+- **libcamera** (para `rpicam-still`)
+- **Raspbian GNU/Linux 12** (Bookworm)
 
-* Para habilitar RTS/CTS en Raspberry Pi importante activar  el firmware
+---
 
-  - En /boot/firmware/config.txt (Bookworm) o /boot/config.txt (Bullseye y anteriores), agrega:
-   
-   ```
-	dtoverlay=uart0,ctsrts
-    ```
-	
- 
-## 📁 Estructura de carpetas
+## 🔌 Conexiones UART
+
+### Configuración Básica (Solo Datos):
+```
+Servidor (camaraN1)        Cliente (raspberrypi)
+Pin 8  (GPIO14/TXD) ──────→ Pin 10 (GPIO15/RXD)
+Pin 10 (GPIO15/RXD) ←────── Pin 8  (GPIO14/TXD)
+Pin 6  (GND)        ←────→ Pin 6  (GND)
+```
+
+### Configuración Completa (con RTS/CTS):
+```
+Servidor                   Cliente
+Pin 11 (GPIO17/RTS) ──────→ Pin 36 (GPIO16/CTS)
+Pin 36 (GPIO16/CTS) ←────── Pin 11 (GPIO17/RTS)
++ conexiones básicas arriba
+```
+
+---
+
+## 📁 Estructura del Proyecto
 
 ```
 sistema-camara-uart/
 ├── client/
-│   ├── APIs/
-│   └── uart_client_v5.py
+│   └── uart_client_v5.py          # Cliente con protocolo ACK
 ├── server/
 │   ├── APIs/
-│   │   ├── photo_api.py
-│   │   └── transport_api.py
-│   └── uart_server_v5.py
-└── init.sh
+│   │   ├── photo_api.py            # API de captura (cámara + fallback)
+│   │   ├── transport_api.py        # Transporte estándar
+│   │   └── transport_api_ack.py    # Transporte con ACK
+│   └── uart_server_v5.py           # Servidor con ACK
+├── config/
+│   ├── config.md                   # Configuración UART
+│   ├── uart_config.sh              # Script de configuración
+│   └── server_imagen_init.sh       # Servidor de imágenes HTTP
+├── docs/
+│   ├── conexiones.md               # Esquemas de conexión
+│   ├── ejemplos_uso.md             # Ejemplos prácticos
+│   └── tests_preliminares.md       # Guía de testing
+├── test/
+│   ├── test_photo_api.sh           # Test API de captura
+│   └── test_imagenes_generadas.sh  # Verificación de imágenes
+├── init.sh                         # Script principal de inicio
+└── README.md
 ```
-
-**Notas**
-
-* `uart_server_v5.py` importa `photo_api.py` y `transport_api.py` desde `server/APIs`.
-* `init.sh` arranca **servidor** o **cliente** con flags uniformes.
 
 ---
 
-## 🧩 Requisitos
+## ⚙️ Configuración Previa
 
-* **Python 3.9+**
-* **pyserial**: `pip install pyserial`
-* Raspberry Pi con stack **libcamera** (para `rpicam-still`).
-* Permisos de acceso a `/dev/serial0` (usuario en grupo `dialout`).
+### 1. Habilitar UART en Raspberry Pi
 
+Editar `/boot/firmware/config.txt`:
+```ini
+enable_uart=1
+dtoverlay=disable-bt         # Libera UART principal
+dtoverlay=uart0,ctsrts       # Habilita RTS/CTS (opcional)
+```
+
+### 2. Deshabilitar Console en UART
 ```bash
-# ejemplo
-sudo apt-get update
-sudo apt-get install -y python3-pip
-pip3 install --upgrade pyserial
+sudo systemctl disable --now serial-getty@serial0.service
+sudo systemctl disable --now serial-getty@ttyS0.service
 ```
 
----
-
-## ⚙️ Config UART en Raspberry Pi
-
-1. **Habilitar la interfaz serie** (y deshabilitar login por UART):
-
-   * `sudo raspi-config` → *Interface Options* → *Serial Port* → **Login shell: No**; **Serial interface: Yes**.
-2. **Deshabilitar getty** si estuviera activo en el mismo puerto:
-
-   ```bash
-   sudo systemctl disable --now serial-getty@ttyS0.service || true
-   ```
-3. **Puertos** típicos:
-
-   * `/dev/serial0` → *alias estable* al UART principal.
-   * `/dev/ttyS0` / `/dev/ttyAMA0` según modelo/config.
-
----
-
-## 🔐 Protocolo (especificación breve)
-
-* **Comandos (cliente → servidor)**
-
-  * `<>` con JSON minimalista estilo `key:value`:
-
-    * `<FOTO:{size_name:THUMBNAIL}>`  → capturar y **enviar** inmediatamente.
-    * `<CAPTURAR:{size_name:THUMBNAIL}>` → solo capturar y guardar (servidor responde con `OK|size`).
-    * `<ENVIAR:{path:LAST}>` o `<ENVIAR:{path:/ruta/archivo.jpg}>` → enviar archivo (último o ruta).
-* **Respuestas (servidor → cliente)**
-
-  * `OK|<size>\r\n` o `BAD|<reason>\r\n`.
-* **Stream de datos (tras `OK|size`)**
-
-  1. `0xAA` × 10 (inicio binario)
-  2. **tamaño** (4 bytes **big‑endian**)
-  3. **JPEG** (`size` bytes exactos)
-  4. *(opcional)* `0xBB` × 10 + `<FIN_TRANSMISION>\r\n` (solo para debug humano)
-
-> El **cliente** debe **leer exactamente** el tamaño y **no** cortar por patrones dentro del flujo.
-
----
-
-## ▶️ Uso con `init.sh`
-
-### Servidor
-
+### 3. Configurar Permisos
 ```bash
-# XON/XOFF + fallback y pausas entre chunks (mitiga pérdidas sin flow control HW)
-./init.sh server --port /dev/serial0 --baud 57600 --xonxoff \
-  --fallback /home/pi/test.jpg --sleep-ms 2
-
-# Con RTS/CTS (si está cableado)
-./init.sh server --port /dev/serial0 --baud 57600 --rtscts --sleep-ms 0
+sudo usermod -aG dialout $USER
+sudo usermod -aG tty $USER
+# Reiniciar sesión para aplicar cambios
 ```
 
-### Cliente
-
+### 4. Configuración UART Estándar
 ```bash
-# Espera hasta 60 s por OK|size, XON/XOFF, resolución THUMBNAIL
-./init.sh client --port /dev/serial0 --baud 57600 --xonxoff \
-  --resp-timeout 60 --resolution THUMBNAIL
+# Usando el script incluido
+chmod +x config/uart_config.sh
+./config/uart_config.sh
 
-# Con RTS/CTS (si está cableado)
-./init.sh client --port /dev/ttyS0 --baud 57600 --rtscts --resp-timeout 45
+# O manualmente:
+stty -F /dev/serial0 57600 cs8 -cstopb -parenb crtscts -ixon -ixoff
 ```
-
-### Variables de entorno equivalentes
-
-* `UART_MODE=server|client`
-* `UART_PORT`, `UART_BAUD`
-* `UART_XONXOFF=0|1`, `UART_RTSCTS=0|1`
-* `USE_CAMERA=1|0`, `FALLBACK_IMAGE=/ruta/test.jpg`
-* `SERVER_SLEEP_MS=0..5` (pausa entre chunks en servidor)
-* `RESP_TIMEOUT=seg` (timeout cliente para `OK|size`)
 
 ---
 
-## 🧪 Ejemplos útiles
+## 🚀 Uso del Sistema
 
-**Solo capturar (sin enviar):**
+### Script Principal `init.sh`
 
+El script `init.sh` es la interfaz principal para ambos modos:
+
+#### Servidor (Raspberry Pi con cámara):
 ```bash
-# desde cualquier terminal conectada al puerto del servidor
-echo "<CAPTURAR:{size_name:THUMBNAIL}>" > /dev/serial0
-# servidor responde: OK|<size>  (guarda en /tmp/last.jpg)
+# Con RTS/CTS (recomendado si está cableado)
+./init.sh server --port /dev/serial0 --baud 57600 --rtscts
+
+# Con XON/XOFF (alternativa software)
+./init.sh server --port /dev/serial0 --baud 57600 --xonxoff --sleep-ms 2
+
+# Solo fallback (sin cámara)
+./init.sh server --port /dev/serial0 --baud 57600 --no-camera \
+  --fallback ~/test_fallback.jpg --sleep-ms 1
+
+# Alta velocidad con control de flujo
+./init.sh server --port /dev/serial0 --baud 115200 --rtscts \
+  --fallback ~/backup.jpg
 ```
 
-**Solo enviar la última foto:**
+#### Cliente (Raspberry Pi receptor):
+```bash
+# Configuración estándar
+./init.sh client --port /dev/serial0 --baud 57600 --rtscts \
+  --resolution HD_READY --resp-timeout 60
 
+# Con salida personalizada
+./init.sh client --port /dev/serial0 --baud 57600 --rtscts \
+  --resolution FULL_HD --output ~/fotos/captura_$(date +%H%M).jpg
+
+# Para conexiones lentas
+./init.sh client --port /dev/serial0 --baud 38400 --xonxoff \
+  --resolution THUMBNAIL --resp-timeout 90
+```
+
+---
+
+## 📖 Comandos del Protocolo
+
+### Comandos Disponibles:
+
+#### `<FOTO:{size_name:RESOLUTION}>`
+Captura y envía inmediatamente:
+```bash
+echo "<FOTO:{size_name:HD_READY}>" > /dev/serial0
+```
+
+#### `<CAPTURAR:{size_name:RESOLUTION}>`
+Solo captura (guarda en `/tmp/last.jpg`):
+```bash
+echo "<CAPTURAR:{size_name:FULL_HD}>" > /dev/serial0
+```
+
+#### `<ENVIAR:{path:LAST}>`
+Envía última foto capturada:
 ```bash
 echo "<ENVIAR:{path:LAST}>" > /dev/serial0
-# servidor responde OK|<size> y transmite por tamaño exacto
 ```
 
-**Flujo completo en un paso (cliente v5):** usa el comando `FOTO`.
+#### `<ENVIAR:{path:/ruta/archivo.jpg}>`
+Envía archivo específico:
+```bash
+echo "<ENVIAR:{path:/home/pi/mi_foto.jpg}>" > /dev/serial0
+```
 
 ---
 
-## 👍 Buenas prácticas para fiabilidad
+## 🔧 Opciones de Configuración
 
-* **Flow control preferente**: usa **RTS/CTS** si está cableado (`--rtscts`). Si no, **XON/XOFF** (`--xonxoff`).
-* **Sin flow control**: agrega `--sleep-ms 1..3` en el servidor y/o baja baudios (p. ej., 38400).
-* **Cliente por tamaño exacto**: inmune a falsos positivos por marcadores dentro del JPEG.
-* **Cámara lenta**: limita captura con timeout (8 s) y configura **fallback**.
+### Variables de Entorno:
+```bash
+export UART_MODE=server          # server | client
+export UART_PORT=/dev/serial0    # Puerto UART
+export UART_BAUD=57600          # Velocidad
+export UART_RTSCTS=1            # Control de flujo hardware
+export UART_XONXOFF=0           # Control de flujo software
+export USE_CAMERA=1             # Usar cámara real
+export FALLBACK_IMAGE=/path/to/backup.jpg
+export SERVER_SLEEP_MS=2        # Pausa entre chunks
+export RESP_TIMEOUT=60          # Timeout cliente
+```
 
----
+### Parámetros del Servidor:
+- `--sleep-ms N`: Pausa entre chunks (0-10ms, mitiga pérdidas)
+- `--no-camera`: Deshabilita cámara, solo fallback
+- `--fallback-image PATH`: Imagen de respaldo
+- `--rtscts` / `--xonxoff`: Control de flujo
 
-## 🛠️ Troubleshooting
-
-**1) Cliente: “Timeout esperando respuesta”**
-
-* El servidor tardó en capturar: aumenta `--resp-timeout` (cliente) o usa `--fallback` (servidor).
-* Revisa con: `rpicam-still -n -t 1 -o /tmp/test.jpg`.
-
-**2) Basura / login en el puerto**
-
-* Deshabilita getty y shell por UART (ver sección UART).
-* Confirma que **cliente y servidor** usan **el mismo puerto y baudios**.
-
-**3) Recibo menos bytes de los anunciados**
-
-* Activa **flow control** o agrega `--sleep-ms`.
-* Verifica cableado GND común, RX↔TX.
-* Baja baudios si hay ruido.
-
-**4) Permisos y puertos**
-
-* Agrega tu usuario a `dialout`: `sudo usermod -aG dialout $USER` y vuelve a iniciar sesión.
-* Prefiere `/dev/serial0` (alias estable) en lugar de `/dev/ttyS0`.
-
-**5) JPEG inválido (sin FFD8/FFD9)**
-
-* Pérdida parcial: ajusta flow control / pausa / baudios; verifica que el servidor haya enviado `size` correcto.
+### Parámetros del Cliente:
+- `--resolution NAME`: Resolución solicitada
+- `--output PATH`: Archivo de salida
+- `--resp-timeout N`: Timeout para respuesta del servidor
 
 ---
 
-## 📈 Roadmap (opcional)
+## 🧪 Testing y Verificación
 
-* **CRC32/MD5** después de la imagen + verificación en cliente.
-* **ACK/NACK** por bloque (retransmisión selectiva).
-* **Métricas** (tiempos de captura, throughput, retries) y health‑checks.
+### 1. Test de Captura (Servidor):
+```bash
+cd server/APIs/
+python3 -c "
+from photo_api import capture_photo
+data = capture_photo('THUMBNAIL', use_camera=True, timeout_s=5)
+if data:
+    print(f'✅ Cámara OK: {len(data)} bytes')
+    with open('/tmp/test_camera.jpg', 'wb') as f: f.write(data)
+else:
+    print('❌ Cámara falló')
+"
+```
+
+### 2. Test de Conectividad:
+```bash
+# En Servidor:
+cat /dev/serial0 &
+
+# En Cliente:
+echo "TEST_CONEXION" > /dev/serial0
+# Debe aparecer "TEST_CONEXION" en el servidor
+```
+
+### 3. Test Completo:
+```bash
+# Terminal 1 (Servidor):
+./init.sh server --port /dev/serial0 --baud 57600 --rtscts
+
+# Terminal 2 (Cliente):
+./init.sh client --port /dev/serial0 --baud 57600 --rtscts \
+  --resolution THUMBNAIL
+```
 
 ---
 
-## 📄 Licencia
+## 📊 Protocolo ACK Detallado
 
-MIT (sugerida) — ajusta según tus necesidades.
+### Flujo de Verificación:
+1. **Transmisión inicial**: Servidor envía datos completos
+2. **Cliente verifica**: Cuenta bytes recibidos vs esperados
+3. **ACK_OK**: Si todo está correcto
+4. **ACK_MISSING**: Si faltan datos, indica cuántos bytes se recibieron
+5. **Retransmisión**: Servidor envía solo los bytes faltantes
+6. **Confirmación final**: Cliente confirma recepción completa
+
+### Ejemplo de Logs ACK:
+```
+[Servidor] 📊 Enviando 45823 bytes con verificación ACK...
+[Servidor] 📤 Envío inicial completado, esperando ACK...
+[Cliente]  📊 Recepción inicial: 45823/45823 bytes
+[Cliente]  📨 Enviando ACK_OK
+[Servidor] ✅ ACK_OK - Cliente recibió todo
+[Servidor] 🎉 Transmisión verificada exitosamente
+```
+
+### En Caso de Pérdida:
+```
+[Cliente]  📊 Recepción inicial: 45234/45823 bytes
+[Cliente]  📨 Enviando ACK_MISSING: faltan 589 bytes
+[Servidor] ⚠️ ACK_MISSING - Faltan 589 bytes
+[Servidor] 🔄 Retransmitiendo 589 bytes desde offset 45234
+[Cliente]  🔄 Leyendo 589 bytes de corrección...
+[Cliente]  📨 Enviando ACK_OK
+[Servidor] ✅ Corrección exitosa
+```
 
 ---
 
-## 👤 Créditos
+## ⚡ Optimización de Rendimiento
 
-Diseño y mejoras colaborativas con foco en robustez de protocolo y separación de responsabilidades (captura vs transporte).
+### Configuraciones Recomendadas:
+
+#### Conexión Estable (RTS/CTS):
+```bash
+# Velocidad alta, sin pausas
+./init.sh server --baud 115200 --rtscts --sleep-ms 0
+./init.sh client --baud 115200 --rtscts
+```
+
+#### Conexión Problemática:
+```bash
+# Velocidad moderada con pausas
+./init.sh server --baud 57600 --xonxoff --sleep-ms 3
+./init.sh client --baud 57600 --xonxoff --resp-timeout 90
+```
+
+#### Conexión Muy Inestable:
+```bash
+# Velocidad baja, máximas pausas
+./init.sh server --baud 38400 --sleep-ms 5
+./init.sh client --baud 38400 --resp-timeout 120
+```
+
+### Desaceleración Adaptativa:
+El sistema automáticamente reduce la velocidad en los últimos KB:
+- Últimos 5KB: 5× más lento
+- Últimos 2KB: 10× más lento
+- Últimos 512B: 20× más lento
+- Últimos 256B: 25× más lento
+
+---
+
+## 🛠️ Solución de Problemas
+
+### Error: "Timeout esperando respuesta"
+```bash
+# Aumentar timeout del cliente
+./init.sh client --resp-timeout 90
+
+# Configurar imagen de fallback en servidor
+./init.sh server --fallback ~/backup.jpg
+```
+
+### Error: "ACK_MISSING persistente"
+```bash
+# Reducir velocidad y aumentar pausas
+./init.sh server --baud 38400 --sleep-ms 5 --xonxoff
+
+# Verificar conexiones físicas (GND, RX↔TX)
+```
+
+### Error: "Basura en puerto serial"
+```bash
+# Deshabilitar getty
+sudo systemctl disable --now serial-getty@ttyS0.service
+
+# Limpiar configuración
+sudo stty -F /dev/serial0 sane
+./config/uart_config.sh
+```
+
+### Error: "Permisos denegados"
+```bash
+# Agregar usuario a grupos necesarios
+sudo usermod -aG dialout,tty $USER
+# Reiniciar sesión
+```
+
+---
+
+## 📈 Monitoreo y Logs
+
+### Logs del Servidor:
+- `✅ UART conectado`
+- `🎯 FOTO HD_READY` - Comando recibido
+- `📊 Enviando X bytes` - Inicio transmisión
+- `🐌 Desaceleración` - Últimos KB
+- `✅ Envío COMPLETAMENTE VERIFICADO`
+
+### Logs del Cliente:
+- `📤 Enviando comando`
+- `✅ Respuesta recibida: OK|45823`
+- `📊 Progreso: 30000/45823 bytes (65%)`
+- `📨 Enviando ACK_OK`
+- `✅ PROCESO COMPLETO EXITOSO`
+
+---
+
+## 🔮 Funcionalidades Avanzadas
+
+### Servidor HTTP para Imágenes:
+```bash
+# Iniciar servidor HTTP en puerto 5000
+cd ~/camara-uart/fotos/
+python3 -m http.server 5000
+# Acceder: http://IP_RASPBERRY:5000
+```
+
+### Automatización con systemd:
+```bash
+# Crear servicio para auto-inicio
+sudo tee /etc/systemd/system/uart-camera.service << EOF
+[Unit]
+Description=UART Camera Server
+After=network.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/camara-uart
+ExecStart=/home/pi/camara-uart/init.sh server --rtscts
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl enable uart-camera.service
+sudo systemctl start uart-camera.service
+```
+
+---
+
+## 📄 Licencia y Créditos
+
+**Licencia**: MIT
+
+**Desarrollado** con enfoque en robustez, verificación de integridad, y recuperación automática de errores. El sistema está optimizado para transmisiones confiables en entornos con posibles interferencias o limitaciones de hardware.
+
+---
+
+## 🤝 Contribuciones
+
+Para reportar problemas, sugerir mejoras o contribuir:
+1. Crear issue describiendo el problema/mejora
+2. Incluir logs relevantes
+3. Especificar configuración de hardware
+4. Proporcionar pasos para reproducir
+
+---
+
+## 📚 Documentación Adicional
+
+- **docs/conexiones.md**: Esquemas detallados de conexión
+- **docs/ejemplos_uso.md**: Casos de uso específicos
+- **config/config.md**: Configuración avanzada UART
+- **test/**: Scripts de testing y verificación
